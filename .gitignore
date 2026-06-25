@@ -1,0 +1,34 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv1/
+.conda/
+venv/
+env/
+
+# IDE and local tool state
+.idea/
+.vscode/
+.cache/
+.matplotlib/
+
+# Build and packaging outputs
+build/
+dist/
+*.spec
+
+# Local generated geometry/results
+results/
+voronoi_cells/
+*.stl
+
+# OS noise
+.DS_Store
+Thumbs.db
