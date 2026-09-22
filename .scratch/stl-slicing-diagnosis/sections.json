@@ -1,0 +1,198 @@
+[
+  {
+    "path": "C:\\Users\\24680\\Desktop\\Transition_tpms.stl",
+    "weld_tolerance_mm": 1e-05,
+    "levels": [
+      {
+        "relative_level": 0.2,
+        "z_mm": 2.300643133209087,
+        "raw_segments": 121799,
+        "intersection_seconds": 1.3608271999983117,
+        "vertices": 121799,
+        "unique_segments": 121799,
+        "collapsed_segments": 0,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 1477,
+        "total_contour_length_mm": 7360.967032500886,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 60.0,
+          "p10": 60.0,
+          "p50": 64.0,
+          "p90": 120.0,
+          "p99": 120.0
+        },
+        "assembly_seconds": 0.7705954999983078
+      },
+      {
+        "relative_level": 0.4,
+        "z_mm": 4.601266985450638,
+        "raw_segments": 112526,
+        "intersection_seconds": 2.0965776999946684,
+        "vertices": 112526,
+        "unique_segments": 112526,
+        "collapsed_segments": 0,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 1483,
+        "total_contour_length_mm": 6872.065964572122,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 54.0,
+          "p10": 54.0,
+          "p50": 54.0,
+          "p90": 123.0,
+          "p99": 123.0
+        },
+        "assembly_seconds": 1.2226597999979276
+      },
+      {
+        "relative_level": 0.6,
+        "z_mm": 6.90189083769219,
+        "raw_segments": 148478,
+        "intersection_seconds": 1.393849499989301,
+        "vertices": 148478,
+        "unique_segments": 148478,
+        "collapsed_segments": 0,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 1473,
+        "total_contour_length_mm": 9027.799883485903,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 78.0,
+          "p10": 78.0,
+          "p50": 85.0,
+          "p90": 134.0,
+          "p99": 134.0
+        },
+        "assembly_seconds": 1.026635600006557
+      },
+      {
+        "relative_level": 0.8,
+        "z_mm": 9.202514689933741,
+        "raw_segments": 137318,
+        "intersection_seconds": 1.2923085000074934,
+        "vertices": 137318,
+        "unique_segments": 137318,
+        "collapsed_segments": 0,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 1495,
+        "total_contour_length_mm": 8045.558876096038,
+        "small_contours_le_8_segments": 1,
+        "component_segment_quantiles": {
+          "p01": 72.0,
+          "p10": 72.0,
+          "p50": 74.0,
+          "p90": 128.0,
+          "p99": 132.0
+        },
+        "assembly_seconds": 0.853873999993084
+      }
+    ]
+  },
+  {
+    "path": "C:\\Users\\24680\\Desktop\\打印测试1.stl",
+    "weld_tolerance_mm": 1e-05,
+    "levels": [
+      {
+        "relative_level": 0.2,
+        "z_mm": -6.0,
+        "raw_segments": 71677,
+        "intersection_seconds": 2.9807334000070114,
+        "vertices": 60929,
+        "unique_segments": 60929,
+        "collapsed_segments": 10748,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 39,
+        "total_contour_length_mm": 2490.8060072241383,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 42.879999999999995,
+          "p10": 274.40000000000003,
+          "p50": 1359.0,
+          "p90": 3044.8,
+          "p99": 4482.699999999998
+        },
+        "assembly_seconds": 0.771419299999252
+      },
+      {
+        "relative_level": 0.4,
+        "z_mm": -2.0,
+        "raw_segments": 68893,
+        "intersection_seconds": 3.187749699995038,
+        "vertices": 58570,
+        "unique_segments": 58570,
+        "collapsed_segments": 10323,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 76,
+        "total_contour_length_mm": 2379.671798048764,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 111.5,
+          "p10": 237.5,
+          "p50": 248.0,
+          "p90": 1546.0,
+          "p99": 6912.0
+        },
+        "assembly_seconds": 0.8205725000007078
+      },
+      {
+        "relative_level": 0.6,
+        "z_mm": 2.0,
+        "raw_segments": 69040,
+        "intersection_seconds": 3.016045000011218,
+        "vertices": 58365,
+        "unique_segments": 58365,
+        "collapsed_segments": 10675,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 75,
+        "total_contour_length_mm": 2412.6762365115096,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 119.08,
+          "p10": 225.8,
+          "p50": 238.0,
+          "p90": 972.2000000000011,
+          "p99": 9267.16000000015
+        },
+        "assembly_seconds": 0.9671666000067489
+      },
+      {
+        "relative_level": 0.8,
+        "z_mm": 6.0,
+        "raw_segments": 70409,
+        "intersection_seconds": 2.8109344000113197,
+        "vertices": 59688,
+        "unique_segments": 59688,
+        "collapsed_segments": 10721,
+        "duplicate_segments": 0,
+        "open_vertices": 0,
+        "branch_vertices": 0,
+        "contour_components": 44,
+        "total_contour_length_mm": 2473.0986759113766,
+        "small_contours_le_8_segments": 0,
+        "component_segment_quantiles": {
+          "p01": 19.16,
+          "p10": 307.9,
+          "p50": 1394.5,
+          "p90": 2681.3,
+          "p99": 2970.0
+        },
+        "assembly_seconds": 0.6675267999962671
+      }
+    ]
+  }
+]

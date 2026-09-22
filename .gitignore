@@ -1,0 +1,41 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv1/
+.conda/
+venv/
+env/
+
+# IDE and local tool state
+.idea/
+.vscode/
+.cache/
+.matplotlib/
+
+# Build and packaging outputs
+build/
+dist/
+*.spec
+!packaging/*.spec
+src/*.egg-info/
+tmp/
+!packaging/*.spec
+src/*.egg-info/
+tmp/
+
+# Local generated geometry/results
+results/
+voronoi_cells/
+*.stl
+!resources/examples/**/*.stl
+
+# OS noise
+.DS_Store
+Thumbs.db
