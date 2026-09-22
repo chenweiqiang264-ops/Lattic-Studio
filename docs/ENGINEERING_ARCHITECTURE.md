@@ -19,6 +19,7 @@ src/lattice_studio/
     native/           optional C++ extensions and build sources
   presentation/qt/    Qt composition, widgets, workers, view state
     viewers/          PyVista/Open3D rendering adapters
+  presentation/http/  loopback HTTP adapter and desktop-client transport
 ```
 
 The intended dependency direction is:
@@ -49,6 +50,23 @@ The stable scripting facade is `lattice_studio.public.LatticeStudio`. New
 headless operations belong in `application/`, then are exposed deliberately
 through this facade; callers must not import Qt widgets or the historical test
 entrypoint.
+
+## Local backend migration
+
+`application.backend.LocalBackend` is the interface for a standalone local
+backend process. It owns short-lived workspace sessions and delegates workspace
+behavior to application use cases; it does not expose Qt, VTK, `trimesh`, CUDA
+buffers, or renderer caches. `presentation.http.local_backend` is its loopback
+HTTP adapter, bound only to `127.0.0.1`, with a Python client adapter for the
+desktop front end.
+
+The first transport operations are workspace health, creation, loading, lookup,
+and explicit save. Existing Qt workflows remain in-process during migration.
+New remote-capable operations must first be expressed through the application
+backend interface, use serializable request and result data, and add a
+representative transport contract test. Long-running generation will use task
+identifiers and progress events rather than transferring evaluator, VTK, or GPU
+objects across the seam.
 
 ## Workspace and persistence
 

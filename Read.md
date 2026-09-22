@@ -28,9 +28,15 @@ main.py / python -m lattice_studio
 
 - `main.py` 是源码检出的兼容启动器，会将 `src/` 加入模块路径后调用包入口。
 - `src/lattice_studio/__main__.py` 负责冻结进程支持、CUDA 子进程探测、发布
-  自检命令，以及 Qt 工作台启动。
+  自检命令、Qt 工作台启动，以及本地后端的 `--serve-backend` 启动命令。
 - `src/lattice_studio/public.py` 提供稳定的无界面门面 `LatticeStudio`，目前
   暴露工作区和晶格生成服务。
+
+本地后端可独立启动，默认只监听本机回环地址：
+
+```powershell
+.\.venv\Scripts\python.exe -m lattice_studio --serve-backend
+```
 
 ### 目标依赖方向
 
@@ -53,6 +59,11 @@ infrastructure --------> domain/application contracts
 与 `public.py` 是将可复用工作流从 Qt 层收拢出去的方向。新增功能应优先在
 `domain` 定义规则，在 `application` 落实用例，在 `engine` 实现数值工作，
 最后由 Qt 层接入。
+
+前后端分离已进入第一阶段：`application.backend.LocalBackend` 管理本地后端
+工作区会话，`presentation/http/` 提供仅绑定 `127.0.0.1` 的 HTTP adapter 和
+Python 客户端。当前 Qt 工作台尚未完全迁移，仍是分层单进程界面；新的可远程调用
+工作流应先通过该后端 interface 建立，再逐步替换 Qt 中的直接调用。
 
 ### 核心数据流
 
@@ -86,7 +97,6 @@ infrastructure --------> domain/application contracts
 
 根目录的其他重要文件：
 
-- `README.md`：项目概览、启动方式和常用命令。
 - `pyproject.toml`：包元数据、Python 版本范围、控制台入口和 pytest 配置。
 - `CONTEXT.md`：领域术语和已达成的概念约束；其中的目标描述不自动等同于当前
   UI 已实现的功能。
@@ -119,6 +129,7 @@ infrastructure --------> domain/application contracts
   - `workbench.py`：当前主界面与主要集成点。
   - `viewers/`：PyVista、Open3D 和基础查看器适配器。
   - `tools/`：交互式剖切等界面工具。
+- `presentation/http/`：仅绑定 `127.0.0.1` 的 HTTP 后端 adapter 及 Python 客户端。
 
 ### `tests/`
 
@@ -179,9 +190,9 @@ CUDA 的 CPU 路径、STL 导出回读、Qt 主窗口启停与真实卸载均已
 验证包括干净 Windows 环境、人工建模和完整渲染验收、不同 GPU/驱动组合，以及全量
 业务与压力回归。
 
-当前 Git 工作区是一次未提交的目录迁移：旧 `core/`、`ui/` 和旧根目录测试已被
-标记删除，而 `src/`、`docs/`、`tests/`、`packaging/` 等新目录仍未跟踪。它们是
-迁移成果，不能被当作冗余文件清理或通过 Git 恢复到旧布局。现有测试也应保留。
+此前的目录迁移已在 Git 快照提交 `5244b11` 中保留：旧 `core/`、`ui/` 和旧根目录
+测试由 `src/`、`docs/`、`tests/`、`packaging/` 等新布局替代。新布局是迁移成果，
+不能被当作冗余文件清理或通过 Git 恢复到旧目录；现有测试也应保留。
 
 ## CodeGraph 状态
 

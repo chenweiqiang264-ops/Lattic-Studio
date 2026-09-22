@@ -60,6 +60,10 @@ def main() -> int:
     import multiprocessing
 
     multiprocessing.freeze_support()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--serve-backend":
+        from lattice_studio.presentation.http.local_backend import main as run_backend
+
+        return run_backend(sys.argv[2:])
     if len(sys.argv) == 3 and sys.argv[1] == "--cuda-probe-worker":
         from lattice_studio.engine.implicit.cuda_probe import run_probe_worker
         return run_probe_worker(sys.argv[2])
