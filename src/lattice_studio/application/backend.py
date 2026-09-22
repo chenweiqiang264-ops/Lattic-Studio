@@ -13,6 +13,10 @@ from uuid import uuid4
 
 from lattice_studio.application.workspace import WorkspaceService
 from lattice_studio.application.backend_workflows import ImplicitWorkflowTasks
+from lattice_studio.application.workspace_commands import (
+    WorkspaceCommandService,
+    workspace_snapshot,
+)
 from lattice_studio.application.tasks import (
     BackendTaskService,
     TaskOutcome,
@@ -28,6 +32,8 @@ SUPPORTED_OPERATIONS = (
     "task.artifact.get",
     "workspace.create",
     "workspace.get",
+    "workspace.snapshot",
+    "workspace.commands",
     "workspace.load",
     "workspace.save",
 )
@@ -105,6 +111,7 @@ class LocalBackend:
     ) -> None:
         self._workspace_service = workspace_service or WorkspaceService()
         self._workspaces: dict[str, DesignWorkspace] = {}
+        self._workspace_commands = WorkspaceCommandService()
         self._implicit_workflow_tasks = ImplicitWorkflowTasks()
         self._task_service = task_service or BackendTaskService(
             {
@@ -116,7 +123,7 @@ class LocalBackend:
     def health(self) -> BackendHealth:
         """Report the stable operations implemented by this backend version."""
 
-        return BackendHealth(version="0.1.1", operations=SUPPORTED_OPERATIONS)
+        return BackendHealth(version="0.1.2", operations=SUPPORTED_OPERATIONS)
 
     def create_workspace(self) -> WorkspaceSession:
         """Create and retain an empty design workspace."""
@@ -128,6 +135,23 @@ class LocalBackend:
 
         return self._summary(identifier, self._workspace(identifier))
 
+    def workspace_snapshot(self, identifier: str) -> dict[str, object]:
+        """Return a transport-safe view of editable definitions in a session."""
+
+        return workspace_snapshot(identifier, self._workspace(identifier))
+
+    def apply_workspace_commands(
+        self,
+        identifier: str,
+        commands: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Commit an all-or-nothing batch of fixed workspace commands."""
+
+        workspace = self._workspace(identifier)
+        updated, mutations = self._workspace_commands.apply(workspace, commands)
+        self._workspaces[identifier] = updated
+        return workspace_snapshot(identifier, updated, mutations=mutations)
+
     def load_workspace(self, manifest_path: str | Path) -> WorkspaceSession:
         """Load a persisted workspace into a new backend session."""
 
@@ -138,7 +162,9 @@ class LocalBackend:
         """Persist an existing session and return its post-save summary."""
 
         workspace = self._workspace(identifier)
-        self._workspace_service.save(workspace, self._manifest_path(manifest_path))
+        path = self._manifest_path(manifest_path)
+        self._package_workspace_assets(workspace, path.parent)
+        self._workspace_service.save(workspace, path)
         return self._summary(identifier, workspace)
 
     def submit_task(
@@ -189,6 +215,46 @@ class LocalBackend:
             return self._workspaces[identifier]
         except KeyError as exc:
             raise UnknownWorkspace(identifier) from exc
+
+    def _package_workspace_assets(self, workspace: DesignWorkspace, root: Path) -> None:
+        """Make imported document assets portable before writing a manifest."""
+
+        from lattice_studio.engine.design_domains import MeshDesignDomain
+
+        documents = tuple(workspace.documents.values()) + tuple(
+            workspace.archived_documents.values()
+        )
+        for document in documents:
+            domain = document.domain
+            if not isinstance(domain, MeshDesignDomain):
+                continue
+            if domain.asset_path is None:
+                raise ValueError("mesh design domain must have a source STL path")
+            source = Path(domain.asset_path)
+            if not source.is_absolute():
+                source = root / source
+            target = self._workspace_service.package_mesh_asset(
+                source,
+                root,
+                category="design_domains",
+                identifier=document.identifier,
+            )
+            domain.asset_path = target.relative_to(root)
+
+            custom_source = document.settings.get("custom_unit_cell_source_path")
+            if isinstance(custom_source, str) and custom_source.strip():
+                custom_path = Path(custom_source)
+                if not custom_path.is_absolute():
+                    custom_path = root / custom_path
+                custom_target = self._workspace_service.package_mesh_asset(
+                    custom_path,
+                    root,
+                    category="custom_cells",
+                    identifier=document.identifier,
+                )
+                document.settings["custom_unit_cell_source_path"] = str(
+                    custom_target.relative_to(root)
+                )
 
     @staticmethod
     def _manifest_path(value: str | Path) -> Path:

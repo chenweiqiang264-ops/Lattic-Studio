@@ -64,19 +64,19 @@ class LocalBackendProcess:
             stderr=subprocess.DEVNULL,
             creationflags=creationflags,
         )
-        client = LocalBackendClient(base_url, timeout_seconds=0.25)
+        probe = LocalBackendClient(base_url, timeout_seconds=0.25)
         deadline = time.monotonic() + self._startup_timeout_seconds
         while time.monotonic() < deadline:
             if self._process.poll() is not None:
                 self._process = None
                 raise BackendProcessError("local backend exited before becoming ready")
             try:
-                client.health()
+                probe.health()
             except BackendRequestError:
                 time.sleep(0.05)
             else:
-                self._client = client
-                return client
+                self._client = LocalBackendClient(base_url, timeout_seconds=30.0)
+                return self._client
         self.stop()
         raise BackendProcessError("timed out waiting for the local backend")
 

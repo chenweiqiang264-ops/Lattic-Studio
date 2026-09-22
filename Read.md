@@ -1,5 +1,59 @@
 # Lattice Studio 项目架构梳理
 
+## 2026-09-22 Backend Workspace Projection Update
+
+The Qt workbench now creates a private backend workspace with its child
+process and sends editable document actions through atomic
+`workspace.commands` batches. This includes creating mesh and analytic
+documents, duplicating, selecting, renaming, archiving, restoring, deleting,
+replacing a domain, saving, loading, settings, field-object scenes, and field
+visibility. Qt changes its local `DesignWorkspace` mirror only after the
+backend accepts the command.
+
+The backend snapshot is the serializable editable record. Qt rebuilds its
+disposable projection from `workspace.snapshot` when loading a workspace, but
+continues to own widget state, preview actors, and display/runtime caches. A
+new analytic design commits its domain primitive, persistent settings, and
+dual-role field object in one command batch. This prevents field visibility
+changes from targeting an object absent from the backend session.
+
+This is local two-process separation, not a web frontend. The 2026-09-22
+Windows package was rebuilt and passed isolated runtime, CPU-fallback, window,
+and uninstall validation. The remaining architectural work is to retire or
+explicitly retain the legacy direct numerical-worker fallback.
+
+## 2026-09-22 Backend Workflow Status
+
+The desktop remains a PyQt/PyVista application. It starts a private backend
+child process bound only to `127.0.0.1`; this is local process separation, not
+a web frontend.
+
+`application/backend_workflows.py` owns fixed numerical task handlers for
+TPMS, custom cells, plane transitions, shells/fusion, display refinement,
+precise PNG rendering, and STL reconstruction. `presentation/http/task_results.py`
+decodes only metadata, opaque generation handles, and NPZ display fields in
+the client. It deliberately cannot reconstruct an `ImplicitBody`.
+
+For supported mesh-domain single-result flows, `presentation/qt/workbench.py`
+submits a task, polls it on a Qt worker, and downloads artifacts. Legacy
+in-process compatibility paths remain for analytic domains, field-driven
+transitions, combined generation requests, and workspace/document mutation.
+See `docs/Project-Handoff.md` and ADR 0035 for the current migration boundary.
+
+## 2026-09-22 Backend Protocol Extension
+
+The loopback protocol is now `0.1.2`. It supports atomic editable-document
+commands and JSON workspace snapshots (`workspace.commands` and
+`workspace.snapshot`), while keeping runtime state out of that contract.
+
+`generation.batch` returns one opaque generation handle and display-field NPZ
+artifact per request. The workbench uses it for normal multi-result generation.
+Both mesh and analytic design domains are serializable task inputs; field-driven
+transitions carry only the selected analytic primitive definition, and the
+backend reconstructs its own evaluator. Qt still keeps a local document
+projection for editing and UI/display state, so this remains local process
+separation rather than a complete web-style frontend/backend split.
+
 更新日期：2026-09-20
 
 ## 结论

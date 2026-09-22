@@ -52,6 +52,7 @@ class DesignRuntimeState:
     shell_fusion_domain_field: object | None = None
     implicit_results: dict[str, object] = field(default_factory=dict)
     implicit_generation_results: dict[str, object] = field(default_factory=dict)
+    backend_generation_handles: dict[str, object] = field(default_factory=dict)
     implicit_fields: dict[str, object] = field(default_factory=dict)
     raw_results: dict[str, object] = field(default_factory=dict)
     repaired_results: dict[str, object] = field(default_factory=dict)
@@ -68,6 +69,7 @@ class DesignRuntimeState:
         mappings = (
             self.implicit_results,
             self.implicit_generation_results,
+            self.backend_generation_handles,
             self.implicit_fields,
             self.raw_results,
             self.repaired_results,
@@ -259,23 +261,36 @@ class DesignWorkspace:
         self.dirty = True
 
     def create_document(
-        self, domain: DesignDomain, name: str, *, activate: bool = True
+        self,
+        domain: DesignDomain,
+        name: str,
+        *,
+        activate: bool = True,
+        identifier: str | None = None,
     ) -> DesignDocument:
-        document = DesignDocument(self.new_identifier(), name, domain)
+        document = DesignDocument(identifier or self.new_identifier(), name, domain)
         self.add_document(document, activate=activate)
         return document
 
     def activate(self, identifier: str) -> DesignDocument:
         if identifier not in self.documents:
             raise KeyError(f"unknown active design: {identifier}")
-        self.active_design_id = identifier
+        if self.active_design_id != identifier:
+            self.active_design_id = identifier
+            self.dirty = True
         return self.documents[identifier]
 
-    def duplicate_document(self, identifier: str, name: str) -> DesignDocument:
+    def duplicate_document(
+        self,
+        identifier: str,
+        name: str,
+        *,
+        new_identifier: str | None = None,
+    ) -> DesignDocument:
         source = self.documents.get(identifier)
         if source is None:
             raise KeyError(f"unknown active design: {identifier}")
-        duplicate = source.duplicate(self.new_identifier(), name)
+        duplicate = source.duplicate(new_identifier or self.new_identifier(), name)
         self.add_document(duplicate)
         return duplicate
 

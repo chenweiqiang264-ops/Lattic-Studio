@@ -28,9 +28,13 @@ class ManagedDesignWorkspace(DesignWorkspace):
         *,
         asset_path: Path | None = None,
         activate: bool = True,
+        identifier: str | None = None,
     ) -> DesignDocument:
         return self.create_document(
-            MeshDesignDomain(mesh, name, asset_path), name, activate=activate
+            MeshDesignDomain(mesh, name, asset_path),
+            name,
+            activate=activate,
+            identifier=identifier,
         )
 
     def create_analytic_document(
@@ -39,9 +43,13 @@ class ManagedDesignWorkspace(DesignWorkspace):
         name: str,
         *,
         activate: bool = True,
+        identifier: str | None = None,
     ) -> DesignDocument:
         return self.create_document(
-            AnalyticDesignDomain(primitive, name), name, activate=activate
+            AnalyticDesignDomain(primitive, name),
+            name,
+            activate=activate,
+            identifier=identifier,
         )
 
     def package_mesh_domain_asset(

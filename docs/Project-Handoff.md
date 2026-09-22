@@ -1,5 +1,148 @@
 # Project-Handoff
 
+## 2026-09-22 Workspace Projection Migration Update
+
+Current branch: `feature/local-backend-separation`. The working tree contains
+uncommitted backend-separation work on top of the prior continuation changes.
+
+The Qt workbench now owns a private `backend_workspace_id` for its local child
+process. It commits document creation, import/replacement, activation,
+duplication, rename, archive/restore/delete, settings, field-object scenes,
+and field visibility through `workspace.commands` before changing the Qt
+projection. Save first reconciles the current local mirror to the backend and
+then uses backend persistence; load requests a backend snapshot and rebuilds
+the disposable Qt projection from it.
+
+New document initialization is atomic at the protocol boundary. In particular,
+an analytic design's domain primitive, settings, and selectable dual-role
+field object are sent together. A regression test verifies that repeated field
+visibility toggles preserve the local transition result and update the backend
+snapshot as well.
+
+Verified after this follow-up:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src tests
+.\.venv\Scripts\python.exe -m pytest tests\integration\implicit\test_field_object_workspace_actions.py::test_preview_toggle_preserves_transition_and_revision tests\integration\implicit\test_field_object_workspace_actions.py::test_rename_requires_confirmation_and_preserves_results tests\integration\implicit\test_field_object_workspace_actions.py::test_clear_selected_archive_requires_confirmation_and_preserves_other_designs tests\integration\implicit\test_field_object_workspace_actions.py::test_empty_workspace_disables_rename_and_empty_recycle_actions -q
+codegraph.cmd sync
+codegraph.cmd status
+```
+
+The targeted workbench regression suite passed `5 passed`. CodeGraph is
+current with 134 files, 3,570 nodes, and 10,765 edges. The rebuilt
+`dist/installer/LatticeStudio-Setup-0.1.1-x64.exe` passed isolated runtime,
+GPU, forced CPU fallback, Qt lifecycle, and genuine uninstall validation in
+`build/installer-acceptance-workspace-projection-20260922-145200`. Qt retains
+a display/runtime projection and legacy direct-worker compatibility paths, so
+this is not a web frontend or a claim that every UI operation is remote-only.
+The rebuilt installer is 322,019,613 bytes with SHA256
+`B40C30BFBD45FBE13949E433756B18F353DF4006AFCF0BFBD29860A163F2ED0F`.
+
+## 2026-09-22 Protocol and Generation Migration Update
+
+Current branch: `feature/local-backend-separation`. The working tree contains
+uncommitted backend-separation work on top of the prior continuation changes.
+
+The loopback protocol is now `0.1.2`. `LocalBackend` exposes two new
+workspace operations: `workspace.snapshot` returns JSON-safe editable
+definitions, while `workspace.commands` atomically applies a fixed command
+batch for document create/replace, activation, lifecycle, settings, and field
+objects. The command service applies to an isolated candidate workspace before
+committing, so a rejected command leaves the backend session unchanged.
+
+`generation.batch` accepts two to sixteen fixed TPMS/custom/transition
+requests and publishes an opaque generation handle and separate display-field
+NPZ artifact for each request. The Qt workbench uses that batch path for
+combined results. It now serializes both mesh and analytic design domains for
+generation work. A field-driven transition transports only the selected
+`ImplicitPrimitive` DTO; the backend reconstructs the driver evaluator locally.
+No `ImplicitBody`, sampled display field, Qt, VTK, CUDA, or trimesh object
+crosses HTTP.
+
+The remaining separation boundary is precise: Qt still owns its editable
+`DesignWorkspace` projection, save/load UI orchestration, and display/runtime
+caches. The new workspace command API is ready, but those UI mutation actions
+have not yet been switched to it. Do not call the project fully frontend/backend
+separated until that projection and remaining in-process compatibility workers
+are retired or deliberately retained by a new ADR.
+
+Verified after this update:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src tests
+.\.venv\Scripts\python.exe -m pytest tests\integration\test_local_backend_api.py tests\integration\test_local_backend_tasks.py tests\integration\test_workbench_shutdown.py -q
+.\.venv\Scripts\python.exe -m pytest tests\integration\test_design_domain_reload.py -q
+codegraph.cmd status
+codegraph.cmd sync
+```
+
+The HTTP/task/shutdown contract suite passed `20 passed`; the design-domain
+reload suite passed `3 passed`. CodeGraph reports an up-to-date index with 133
+files, 3,542 nodes, and 10,630 edges. CUDA emitted only low-occupancy warnings
+on small fixtures. Packaging has not been rebuilt after this source change;
+rebuild the onedir and installer and rerun installer verification before any
+release claim.
+
+## 2026-09-22 Loopback Workflow Migration Update
+
+Current branch: `feature/local-backend-separation`. The working tree contains
+uncommitted continuation work after `ee9fe6a`.
+
+The local child backend now owns these fixed task kinds:
+
+- `tpms.generate`, `custom.generate`, and plane-driven `transition.generate`;
+- `shell.generate` and `shell.union`, consuming an opaque generation handle;
+- `display.refine`, `render.precise`, and `stl.reconstruct`.
+
+Each generation keeps its `ImplicitBody` in the backend process. The Qt client
+stores only `BackendGenerationResult` handles plus downloaded display-field
+NPZ data. It never recreates an evaluator from a display field. Backend
+precise renders publish a PNG through a dependency-free writer; reconstructed
+meshes are downloaded as STL artifacts.
+
+Workbench adapters currently route a mesh-domain single TPMS/custom/plane
+transition, backend-handle STL reconstruction, backend-handle shell/fusion,
+backend display refinement, and backend precise rendering through the task
+client. The child-process readiness probe still uses a short timeout, while
+the returned client uses 30 seconds for large artifact downloads.
+
+Compatibility paths remain for analytic design domains, field-driven
+transitions, and combined multi-result generation requests. Qt also remains
+the authority for editable `DesignWorkspace` documents, save/load, and UI
+state. Therefore this is a substantial numerical-workflow migration, not yet
+complete frontend/backend separation. Continue with explicit serializable
+workspace/document commands and a backend batch task before claiming that
+goal.
+
+Verified in this workspace after the continuation changes:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src
+.\.venv\Scripts\python.exe -m pytest tests\integration\test_local_backend_tasks.py tests\integration\test_workbench_shutdown.py -q
+```
+
+Result: `14 passed`. The contract suite covers TPMS-to-STL, custom cells,
+plane transitions, shell union, display refinement, precise-render PNGs,
+artifact download, cancellation, and child-process shutdown. Numba emitted
+only low-occupancy CUDA warnings.
+
+Final verification after the proxy-bypass follow-up:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\integration\test_local_backend_api.py tests\integration\test_local_backend_tasks.py tests\integration\test_workbench_shutdown.py -q
+powershell -ExecutionPolicy Bypass -File .\packaging\build_onedir.ps1
+powershell -ExecutionPolicy Bypass -File .\packaging\build_installer.ps1
+powershell -ExecutionPolicy Bypass -File .\packaging\verify_installer.ps1 -TestRoot build\installer-acceptance-backend-final-20260922-133202
+```
+
+The focused suite passed `17 passed`. A fresh `dist/LatticeStudio` health
+check passed. The installer acceptance evidence is in
+`build/installer-acceptance-backend-final-20260922-133202`: GPU runtime,
+forced CPU fallback, Qt window open/close, and uninstall all passed, with no
+remaining install files or processes. `LocalBackendClient` now disables proxy
+use explicitly, which prevents a configured system proxy from returning 502
+for the private `127.0.0.1` backend.
+
 ## 2026-09-22 Local Backend Separation Update
 
 Current branch: `feature/local-backend-separation`.

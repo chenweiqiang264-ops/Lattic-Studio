@@ -57,3 +57,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/verify_install
 - 人工界面操作验收未完成：截图接口报错，之后用户按 Esc 停止电脑操作，未再继续界面控制。自动窗口开关通过不等于交互建模、渲染效果或全部业务流程通过。
 - CPU 路径通过禁用 CUDA 验证，并非在无 NVIDIA 显卡的物理电脑上验证。其他 GPU/驱动组合尚未验证；CUDA 加速仍需要兼容的 NVIDIA 显卡和驱动。
 - 本次不是全部业务功能的回归或压力测试。
+
+## 2026-09-22 工作区后端迁移后复验
+
+工作区命令与 Qt 投影迁移完成后，重新执行 `build_installer.ps1
+-RebuildOnedir`，并使用新的测试目录运行验收。安装包为
+`dist/installer/LatticeStudio-Setup-0.1.1-x64.exe`，构建后大小为
+322,019,613 字节，SHA256 为
+`B40C30BFBD45FBE13949E433756B18F353DF4006AFCF0BFBD29860A163F2ED0F`。
+
+证据目录：
+`build/installer-acceptance-workspace-projection-20260922-145200`。
+
+- GPU 运行时检查通过：Numba CUDA 使用 NVIDIA GeForce RTX 4060 Laptop GPU，
+  完成 35,937 个采样点和 36,352 个 STL 三角面片的验证。
+- 强制 CPU 回退检查通过：NumPy CPU 完成同一运行时验证。
+- 两次自动 Qt 主窗口打开和关闭均通过。
+- 卸载后 EXE、安装目录、快捷方式和注册项均不存在，残留进程为 0；
+  `TestScriptDeletedInstallFiles=false`。
+
+这仍是开发机上的隔离环境验证，不替代干净 Windows 或另一台物理电脑的验收。

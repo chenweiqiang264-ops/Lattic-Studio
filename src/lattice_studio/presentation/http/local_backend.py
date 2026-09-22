@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from lattice_studio.application.backend import (
     BackendHealth,
@@ -51,6 +51,10 @@ class LocalBackendClient:
             raise ValueError("timeout_seconds must be positive")
         self._base_url = normalized
         self._timeout_seconds = float(timeout_seconds)
+        # A loopback backend must never escape through a corporate/system
+        # proxy.  Besides being unnecessary, proxy routing can turn a healthy
+        # private backend into a misleading 502 response.
+        self._opener = build_opener(ProxyHandler({}))
 
     def health(self) -> BackendHealth:
         return BackendHealth.from_dict(self._request("GET", "/v1/health"))
@@ -61,6 +65,24 @@ class LocalBackendClient:
     def get_workspace(self, identifier: str) -> WorkspaceSession:
         return WorkspaceSession.from_dict(
             self._request("GET", f"/v1/workspaces/{identifier}")
+        )
+
+    def get_workspace_snapshot(self, identifier: str) -> dict[str, object]:
+        """Read editable workspace definitions without materializing engine objects."""
+
+        return self._request("GET", f"/v1/workspaces/{identifier}/snapshot")
+
+    def apply_workspace_commands(
+        self,
+        identifier: str,
+        commands: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Apply a fixed, atomic batch of JSON document commands."""
+
+        return self._request(
+            "POST",
+            f"/v1/workspaces/{identifier}/commands",
+            {"commands": commands},
         )
 
     def load_workspace(self, manifest_path: str) -> WorkspaceSession:
@@ -95,7 +117,7 @@ class LocalBackendClient:
             f"{self._base_url}/v1/artifacts/{identifier}", method="GET"
         )
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
                 return response.read()
         except HTTPError as exc:
             try:
@@ -120,7 +142,7 @@ class LocalBackendClient:
             method=method,
         )
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
                 return _decode_payload(response.read())
         except HTTPError as exc:
             try:
@@ -257,6 +279,20 @@ def _handler_for(backend: LocalBackend) -> type[BaseHTTPRequestHandler]:
             prefix = "/v1/workspaces/"
             if path.startswith(prefix):
                 remainder = unquote(path.removeprefix(prefix))
+                if self.command == "GET" and remainder.endswith("/snapshot"):
+                    identifier = remainder.removesuffix("/snapshot")
+                    if "/" not in identifier:
+                        return backend.workspace_snapshot(identifier)
+                if self.command == "POST" and remainder.endswith("/commands"):
+                    identifier = remainder.removesuffix("/commands")
+                    if "/" not in identifier:
+                        body = self._json_body()
+                        commands = body.get("commands")
+                        if not isinstance(commands, list):
+                            raise ValueError("commands must be a JSON array")
+                        if not all(isinstance(command, dict) for command in commands):
+                            raise ValueError("each workspace command must be a JSON object")
+                        return backend.apply_workspace_commands(identifier, commands)
                 if self.command == "POST" and remainder.endswith("/save"):
                     identifier = remainder.removesuffix("/save")
                     return backend.save_workspace(

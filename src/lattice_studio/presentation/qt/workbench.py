@@ -25,11 +25,14 @@ the GUI.
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 import json
+from shutil import rmtree
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Callable, Literal, TypedDict
 
 if TYPE_CHECKING:
@@ -124,6 +127,17 @@ from lattice_studio.application.workspace import (
     ManagedDesignWorkspace as DesignWorkspace,
     MeshDesignDomain,
     PersistedDerivedMesh,
+)
+from lattice_studio.presentation.http.task_results import (
+    BackendGenerationResult,
+    batch_display_field_artifact_ids,
+    display_field_artifact_id,
+    read_generation_batch,
+    read_generation_result,
+    read_sampled_field,
+)
+from lattice_studio.presentation.http.workspace_results import (
+    read_workspace_projection,
 )
 from lattice_studio.engine.implicit.field_viewer import (
     FieldPlaneCache,
@@ -745,6 +759,18 @@ class _GenerationWorker:  # replaced by Qt worker class when the UI is imported
     pass
 
 
+def _backend_lattice_parameters_payload(
+    parameters: LatticeParameters,
+    resolve_path: Callable[[Path], Path],
+) -> dict[str, object]:
+    """Convert a UI parameter object into the backend's JSON-only DTO."""
+
+    payload = asdict(parameters)
+    if isinstance(parameters, CustomUnitCellParameters):
+        payload["source_path"] = str(resolve_path(parameters.source_path))
+    return payload
+
+
 def _build_collapsible_group_box_class(QtCore, QtWidgets):
     """Build the progressive-disclosure group without importing Qt globally."""
 
@@ -1108,6 +1134,62 @@ def _build_qt_app():
                     f"{type(exc).__name__}: {exc}",
                 )
 
+    class BackendTaskWorker(QtCore.QObject):
+        """Poll one loopback task outside the Qt event thread.
+
+        The worker owns no numerical objects.  A task result reader may only
+        deserialize downloadable artifacts into frontend-safe display data.
+        """
+
+        progress = QtCore.pyqtSignal(str, float)
+        finished = QtCore.pyqtSignal(object)
+        failed = QtCore.pyqtSignal(str)
+
+        def __init__(
+            self,
+            client,
+            task_kind: str,
+            payload: dict[str, object],
+            result_reader: Callable[[object], object],
+        ) -> None:
+            super().__init__()
+            self.client = client
+            self.task_kind = str(task_kind)
+            self.payload = dict(payload)
+            self.result_reader = result_reader
+
+        @QtCore.pyqtSlot()
+        def run(self) -> None:
+            try:
+                task = self.client.submit_task(self.task_kind, self.payload)
+                cancellation_requested = False
+                while task.state not in {"succeeded", "failed", "cancelled"}:
+                    if QtCore.QThread.currentThread().isInterruptionRequested():
+                        if not cancellation_requested:
+                            task = self.client.cancel_task(task.identifier)
+                            cancellation_requested = True
+                        time.sleep(0.05)
+                        continue
+                    self.progress.emit(task.message, task.progress)
+                    time.sleep(0.08)
+                    task = self.client.get_task(task.identifier)
+                self.progress.emit(task.message, task.progress)
+                if task.state == "succeeded":
+                    self.finished.emit(self.result_reader(task))
+                    return
+                message = task.error or task.message or "backend task did not complete"
+                self.failed.emit(message)
+            except Exception as exc:
+                self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+    @dataclass(frozen=True)
+    class BackendStlReconstructionResult:
+        """A mesh artifact decoded from a backend-owned reconstruction task."""
+
+        kind: str
+        mesh: trimesh.Trimesh
+        triangle_count: int
+
     class DisplayRefinementWorker(QtCore.QObject):
         """Build quality-specific sampled fields without blocking the UI thread."""
 
@@ -1394,6 +1476,9 @@ def _build_qt_app():
             self.root = PROJECT_ROOT
             self.backend_process = None
             self.backend_client = None
+            self.backend_workspace_id: str | None = None
+            self._backend_generation_input_root: Path | None = None
+            self._backend_shell_input_root: Path | None = None
             self.design_workspace = DesignWorkspace()
             self._workspace_manifest_path: Path | None = None
             self._workspace_loading = False
@@ -1403,6 +1488,7 @@ def _build_qt_app():
             self.repaired_results: dict[str, trimesh.Trimesh] = {}
             self.implicit_results: dict[str, ImplicitBody] = {}
             self.implicit_generation_results: dict[str, ImplicitGenerationResult] = {}
+            self.backend_generation_handles: dict[str, BackendGenerationResult] = {}
             self.implicit_fields: dict[str, SampledImplicitField] = {}
             self.domain_implicit_field: SampledImplicitField | None = None
             self._shell_fusion_domain_field: SampledImplicitField | None = None
@@ -1487,10 +1573,201 @@ def _build_qt_app():
                 backend_process = LocalBackendProcess()
                 self.backend_client = backend_process.start()
                 self.backend_process = backend_process
+                self.backend_workspace_id = self.backend_client.create_workspace().identifier
             except BackendProcessError as exc:
                 self.backend_process = None
                 self.backend_client = None
+                self.backend_workspace_id = None
                 self.status.setText(f"local backend unavailable: {exc}")
+
+        def _backend_apply_workspace_commands(
+            self,
+            commands: list[dict[str, object]],
+        ) -> bool:
+            """Commit a UI document mutation before changing its local projection."""
+
+            client = self.backend_client
+            workspace_id = self.backend_workspace_id
+            if client is None or workspace_id is None:
+                return True
+            try:
+                client.apply_workspace_commands(workspace_id, commands)
+            except Exception as exc:
+                if (
+                    "unknown active design" in str(exc)
+                    or "unknown design" in str(exc)
+                ) and self._bootstrap_backend_workspace_projection():
+                    try:
+                        client.apply_workspace_commands(workspace_id, commands)
+                    except Exception as retry_exc:
+                        self.status.setText(
+                            f"local backend workspace update failed: {retry_exc}"
+                        )
+                        return False
+                    return True
+                self.status.setText(f"local backend workspace update failed: {exc}")
+                return False
+            return True
+
+        @staticmethod
+        def _backend_field_scene_payload(
+            primitives: dict[str, ImplicitPrimitive],
+            visibility: dict[str, bool],
+        ) -> list[dict[str, object]]:
+            return [
+                {"primitive": asdict(primitive), "visible": bool(visibility[identifier])}
+                for identifier, primitive in primitives.items()
+            ]
+
+        def _sync_workspace_projection_to_backend(self) -> bool:
+            """Publish editable definitions and client-created mesh records before save."""
+
+            if self.backend_client is None or self.backend_workspace_id is None:
+                return True
+            commands: list[dict[str, object]] = []
+            documents = tuple(self.design_workspace.documents.values()) + tuple(
+                self.design_workspace.archived_documents.values()
+            )
+            for document in documents:
+                if isinstance(document.domain, MeshDesignDomain):
+                    source_path = document.domain.asset_path
+                    if source_path is None:
+                        raise ValueError("mesh design domain requires an STL source path")
+                    commands.append(
+                        {
+                            "kind": "document.replace.mesh",
+                            "document_id": document.identifier,
+                            "domain_name": document.domain.name,
+                            "source_path": str(
+                                self._workspace_asset_source_path(source_path).resolve()
+                            ),
+                        }
+                    )
+                else:
+                    commands.append(
+                        {
+                            "kind": "document.replace.analytic",
+                            "document_id": document.identifier,
+                            "domain_name": document.domain.name,
+                            "primitive": asdict(document.domain.primitive),
+                        }
+                    )
+                commands.extend(
+                    (
+                        {
+                            "kind": "document.settings.replace",
+                            "document_id": document.identifier,
+                            "settings": document.settings,
+                        },
+                        {
+                            "kind": "document.field_scene.replace",
+                            "document_id": document.identifier,
+                            "field_primitives": self._backend_field_scene_payload(
+                                document.field_primitives,
+                                document.field_primitive_visibility,
+                            ),
+                        },
+                        {
+                            "kind": "document.derived_meshes.replace",
+                            "document_id": document.identifier,
+                            "derived_meshes": [
+                                {
+                                    "identifier": record.identifier,
+                                    "asset_path": record.asset_path,
+                                    "provenance": record.provenance,
+                                }
+                                for record in document.derived_meshes.values()
+                            ],
+                        },
+                    )
+                )
+            return self._backend_apply_workspace_commands(commands)
+
+        def _bootstrap_backend_workspace_projection(self) -> bool:
+            """Register a legacy local projection in an empty backend session once."""
+
+            client = self.backend_client
+            workspace_id = self.backend_workspace_id
+            if client is None or workspace_id is None:
+                return False
+            try:
+                snapshot = client.get_workspace_snapshot(workspace_id)
+                existing = {
+                    str(item["document_id"])
+                    for key in ("documents", "archived_documents")
+                    for item in snapshot.get(key, [])
+                    if isinstance(item, dict) and "document_id" in item
+                }
+                commands: list[dict[str, object]] = []
+                active_documents = tuple(self.design_workspace.documents.values())
+                archived_documents = tuple(self.design_workspace.archived_documents.values())
+                for document in active_documents + archived_documents:
+                    if document.identifier not in existing:
+                        if isinstance(document.domain, MeshDesignDomain):
+                            if document.domain.asset_path is None:
+                                return False
+                            command = {
+                                "kind": "document.create.mesh",
+                                "document_id": document.identifier,
+                                "name": document.name,
+                                "domain_name": document.domain.name,
+                                "source_path": str(
+                                    self._workspace_asset_source_path(
+                                        document.domain.asset_path
+                                    ).resolve()
+                                ),
+                                "activate": False,
+                            }
+                        else:
+                            command = {
+                                "kind": "document.create.analytic",
+                                "document_id": document.identifier,
+                                "name": document.name,
+                                "domain_name": document.domain.name,
+                                "primitive": asdict(document.domain.primitive),
+                                "activate": False,
+                            }
+                        commands.append(command)
+                    # The desktop may have created its projection before the
+                    # local backend session. Keep existing documents current too.
+                    commands.extend(
+                        (
+                            {
+                                "kind": "document.settings.replace",
+                                "document_id": document.identifier,
+                                "settings": document.settings,
+                            },
+                            {
+                                "kind": "document.field_scene.replace",
+                                "document_id": document.identifier,
+                                "field_primitives": self._backend_field_scene_payload(
+                                    document.field_primitives,
+                                    document.field_primitive_visibility,
+                                ),
+                            },
+                        )
+                    )
+                commands.extend(
+                    {
+                        "kind": "document.archive",
+                        "document_id": document.identifier,
+                    }
+                    for document in archived_documents
+                    if document.identifier not in existing
+                )
+                active_identifier = self.design_workspace.active_design_id
+                if active_identifier is not None:
+                    commands.append(
+                        {
+                            "kind": "document.activate",
+                            "document_id": active_identifier,
+                        }
+                    )
+                if commands:
+                    client.apply_workspace_commands(workspace_id, commands)
+                return True
+            except Exception:
+                return False
 
         def _initialize_empty_workspace(self) -> None:
             """Present a clean document until the user creates or imports a design."""
@@ -1520,6 +1797,7 @@ def _build_qt_app():
             self.repaired_results = {}
             self.implicit_results = {}
             self.implicit_generation_results = {}
+            self.backend_generation_handles = {}
             self.implicit_fields = {}
             self.domain_implicit_body = None
             self.domain_implicit_field = None
@@ -1642,17 +1920,51 @@ def _build_qt_app():
                 "active_tpms_kind": self._active_tpms_kind,
                 "tpms_parameter_states": tpms_parameter_states,
             }
-            if any(
+            settings_changed = any(
                 document.settings.get(key) != value
                 for key, value in persistent_state.items()
-            ):
+            )
+            field_scene_changed = (
+                document.field_primitives != self.field_primitives
+                or document.field_primitive_visibility
+                != {
+                    key: bool(value)
+                    for key, value in self.field_primitive_visibility.items()
+                }
+            )
+            commands = []
+            if settings_changed:
+                updated_settings = dict(document.settings)
+                updated_settings.update(persistent_state)
+                commands.append(
+                    {
+                        "kind": "document.settings.replace",
+                        "document_id": document.identifier,
+                        "settings": updated_settings,
+                    }
+                )
+            if field_scene_changed:
+                commands.append(
+                    {
+                        "kind": "document.field_scene.replace",
+                        "document_id": document.identifier,
+                        "field_primitives": self._backend_field_scene_payload(
+                            self.field_primitives,
+                            self.field_primitive_visibility,
+                        ),
+                    }
+                )
+            if commands and not self._backend_apply_workspace_commands(commands):
+                return
+            if settings_changed:
                 document.settings.update(persistent_state)
                 document.touch()
                 self.design_workspace.dirty = True
-            if document.replace_field_object_scene(
-                self.field_primitives,
-                self.field_primitive_visibility,
-            ):
+            if field_scene_changed:
+                document.replace_field_object_scene(
+                    self.field_primitives,
+                    self.field_primitive_visibility,
+                )
                 self.design_workspace.dirty = True
             runtime = document.runtime
             runtime.domain_implicit_body = self.domain_implicit_body
@@ -1662,6 +1974,7 @@ def _build_qt_app():
             runtime.implicit_generation_results = dict(
                 self.implicit_generation_results
             )
+            runtime.backend_generation_handles = dict(self.backend_generation_handles)
             runtime.implicit_fields = dict(self.implicit_fields)
             runtime.raw_results = dict(self.raw_results)
             runtime.repaired_results = dict(self.repaired_results)
@@ -1678,21 +1991,26 @@ def _build_qt_app():
                 "selected_primitive_identifier": self._selected_primitive_identifier,
             }
 
+        def _new_design_document_settings(self) -> dict[str, object]:
+            """Return the persistent baseline shared by every new Design."""
+
+            return {
+                "ui_control_state": dict(self._default_workspace_control_state),
+                "active_tpms_kind": "G",
+                "tpms_parameter_states": json.loads(
+                    json.dumps(
+                        {
+                            kind: dict(state)
+                            for kind, state in self._default_tpms_parameter_states.items()
+                        }
+                    )
+                ),
+            }
+
         def _initialize_new_design_document(self, document) -> None:
             """Give a newly created Design its own immutable UI baseline."""
 
-            document.settings["ui_control_state"] = dict(
-                self._default_workspace_control_state
-            )
-            document.settings["active_tpms_kind"] = "G"
-            document.settings["tpms_parameter_states"] = json.loads(
-                json.dumps(
-                    {
-                        kind: dict(state)
-                        for kind, state in self._default_tpms_parameter_states.items()
-                    }
-                )
-            )
+            document.settings.update(self._new_design_document_settings())
             document.runtime.ui_transient = {
                 "active_tpms_kind": "G",
                 "tpms_parameter_states": {
@@ -1744,6 +2062,9 @@ def _build_qt_app():
                 self.implicit_results = dict(runtime.implicit_results)
                 self.implicit_generation_results = dict(
                     runtime.implicit_generation_results
+                )
+                self.backend_generation_handles = dict(
+                    runtime.backend_generation_handles
                 )
                 self.implicit_fields = dict(runtime.implicit_fields)
                 self.stl_reconstruction_results = dict(runtime.stl_reconstruction_results)
@@ -1880,6 +2201,11 @@ def _build_qt_app():
                 self._sync_design_workspace_controls()
                 return
             self._store_active_design_state()
+            if not self._backend_apply_workspace_commands(
+                [{"kind": "document.activate", "document_id": identifier}]
+            ):
+                self._sync_design_workspace_controls()
+                return
             self.design_workspace.activate(identifier)
             self._restore_active_design_state()
 
@@ -1890,9 +2216,22 @@ def _build_qt_app():
             if document is None:
                 return
             self._store_active_design_state()
+            duplicate_identifier = self.design_workspace.new_identifier()
+            if not self._backend_apply_workspace_commands(
+                [
+                    {
+                        "kind": "document.duplicate",
+                        "document_id": document.identifier,
+                        "new_document_id": duplicate_identifier,
+                        "name": f"{document.name} 副本",
+                    }
+                ]
+            ):
+                return
             duplicate = self.design_workspace.duplicate_document(
                 document.identifier,
                 f"{document.name} 副本",
+                new_identifier=duplicate_identifier,
             )
             self._restore_active_design_state()
             self.status.setText(f"已创建独立设计：{duplicate.name}")
@@ -1912,9 +2251,38 @@ def _build_qt_app():
                 height_mm=40.0,
                 size_mm=(40.0, 40.0, 40.0),
             )
+            document_identifier = self.design_workspace.new_identifier()
+            initial_settings = self._new_design_document_settings()
+            initial_settings["analytic_domain_primitive_id"] = identifier
+            if not self._backend_apply_workspace_commands(
+                [
+                    {
+                        "kind": "document.create.analytic",
+                        "document_id": document_identifier,
+                        "name": names[kind],
+                        "domain_name": names[kind],
+                        "primitive": asdict(primitive),
+                    },
+                    {
+                        "kind": "document.settings.replace",
+                        "document_id": document_identifier,
+                        "settings": initial_settings,
+                    },
+                    {
+                        "kind": "document.field_scene.replace",
+                        "document_id": document_identifier,
+                        "field_primitives": self._backend_field_scene_payload(
+                            {identifier: primitive},
+                            {identifier: True},
+                        ),
+                    },
+                ]
+            ):
+                return
             document = self.design_workspace.create_analytic_document(
                 primitive,
                 names[kind],
+                identifier=document_identifier,
             )
             self._initialize_new_design_document(document)
             # One primitive may serve as both the authoritative Design domain
@@ -1940,6 +2308,10 @@ def _build_qt_app():
             if document is None:
                 return
             self._store_active_design_state()
+            if not self._backend_apply_workspace_commands(
+                [{"kind": "document.archive", "document_id": document.identifier}]
+            ):
+                return
             self.design_workspace.archive_document(document.identifier)
             self._restore_active_design_state()
 
@@ -1948,6 +2320,16 @@ def _build_qt_app():
                 return
             identifier = self.archived_design_selector.currentData()
             if identifier is None:
+                return
+            if not self._backend_apply_workspace_commands(
+                [
+                    {
+                        "kind": "document.restore",
+                        "document_id": identifier,
+                        "activate": True,
+                    }
+                ]
+            ):
                 return
             self.design_workspace.restore_document(identifier, activate=True)
             self._restore_active_design_state()
@@ -1963,6 +2345,16 @@ def _build_qt_app():
                 return
             if not name.strip():
                 QtWidgets.QMessageBox.warning(self, "名称无效", "设计名称不能为空。")
+                return
+            if not self._backend_apply_workspace_commands(
+                [
+                    {
+                        "kind": "document.rename",
+                        "document_id": document.identifier,
+                        "name": name,
+                    }
+                ]
+            ):
                 return
             self.design_workspace.rename_document(document.identifier, name)
             self._sync_design_workspace_controls()
@@ -1982,6 +2374,10 @@ def _build_qt_app():
                 QtWidgets.QMessageBox.No,
             )
             if answer != QtWidgets.QMessageBox.Yes:
+                return
+            if not self._backend_apply_workspace_commands(
+                [{"kind": "document.remove_archived", "document_id": identifier}]
+            ):
                 return
             self.design_workspace.permanently_remove_archived_document(identifier)
             self._sync_design_workspace_controls()
@@ -2093,7 +2489,16 @@ def _build_qt_app():
                 self._store_active_design_state()
                 self._package_workspace_assets(manifest_path.parent)
                 self._package_derived_meshes(manifest_path.parent)
-                self.design_workspace.save(manifest_path)
+                if self.backend_client is not None and self.backend_workspace_id is not None:
+                    if not self._sync_workspace_projection_to_backend():
+                        return
+                    self.backend_client.save_workspace(
+                        self.backend_workspace_id,
+                        str(manifest_path),
+                    )
+                    self.design_workspace.dirty = False
+                else:
+                    self.design_workspace.save(manifest_path)
                 self._workspace_manifest_path = manifest_path
                 self.status.setText(f"工程已保存：{manifest_path}")
             except (OSError, ValueError, TypeError) as exc:
@@ -2137,7 +2542,16 @@ def _build_qt_app():
                 return
             manifest_path = Path(path)
             try:
-                self.design_workspace = DesignWorkspace.load(manifest_path)
+                if self.backend_client is not None:
+                    session = self.backend_client.load_workspace(str(manifest_path))
+                    snapshot = self.backend_client.get_workspace_snapshot(session.identifier)
+                    self.design_workspace = read_workspace_projection(
+                        snapshot,
+                        manifest_path.parent,
+                    )
+                    self.backend_workspace_id = session.identifier
+                else:
+                    self.design_workspace = DesignWorkspace.load(manifest_path)
                 self._workspace_manifest_path = manifest_path
                 self._restore_persisted_derived_meshes()
                 self._restore_active_design_state()
@@ -4318,6 +4732,9 @@ def _build_qt_app():
             for kind in self.implicit_generation_results:
                 if kind not in (SHELL_RESULT_KEY, SHELL_UNION_RESULT_KEY):
                     self.shell_lattice_combo.addItem(kind, kind)
+            for kind in self.backend_generation_handles:
+                if kind not in (SHELL_RESULT_KEY, SHELL_UNION_RESULT_KEY):
+                    self.shell_lattice_combo.addItem(f"{kind}（后端）", kind)
             if current is not None:
                 index = self.shell_lattice_combo.findData(current)
                 if index >= 0:
@@ -4638,7 +5055,10 @@ def _build_qt_app():
             if isinstance(target, str) and target.startswith("field:"):
                 return None
             result = self.implicit_generation_results.get(target)
-            return result.display_field if result is not None else None
+            if result is not None:
+                return result.display_field
+            backend_result = self.backend_generation_handles.get(target)
+            return backend_result.display_field if backend_result is not None else None
 
         def _field_viewer_can_extend_domain(self) -> bool:
             """Whether the selected source can truthfully query exterior SDF."""
@@ -4972,12 +5392,20 @@ def _build_qt_app():
         def _on_field_viewer_target_changed(self, _index: int = 0) -> None:
             target = self.field_viewer_target_combo.currentData()
             is_primitive = isinstance(target, str) and target.startswith("field:")
+            is_backend_result = target in self.backend_generation_handles
             if is_primitive:
                 authoritative_index = self.field_viewer_source_combo.findData("authoritative")
                 self.field_viewer_source_combo.blockSignals(True)
                 self.field_viewer_source_combo.setCurrentIndex(authoritative_index)
                 self.field_viewer_source_combo.blockSignals(False)
-            self.field_viewer_source_combo.setEnabled(not is_primitive)
+            elif is_backend_result:
+                render_index = self.field_viewer_source_combo.findData("render")
+                self.field_viewer_source_combo.blockSignals(True)
+                self.field_viewer_source_combo.setCurrentIndex(render_index)
+                self.field_viewer_source_combo.blockSignals(False)
+            self.field_viewer_source_combo.setEnabled(
+                not is_primitive and not is_backend_result
+            )
             self._field_plane_state = None
             self._sync_field_viewer_object_visibility_control()
             self._sync_field_viewer_domain_extension_control()
@@ -5249,6 +5677,8 @@ def _build_qt_app():
                 self.contour_result_combo.addItem("设计域 STL", "domain")
             for kind in self.implicit_generation_results:
                 self.contour_result_combo.addItem(kind, kind)
+            for kind in self.backend_generation_handles:
+                self.contour_result_combo.addItem(f"{kind}（后端显示场）", kind)
             if current is not None:
                 index = self.contour_result_combo.findData(current)
                 if index >= 0:
@@ -5280,6 +5710,8 @@ def _build_qt_app():
                 combo.addItem("设计域（解析隐式体）", "domain")
             for kind in self.implicit_generation_results:
                 combo.addItem(kind, kind)
+            for kind in self.backend_generation_handles:
+                combo.addItem(f"{kind}（后端显示场）", kind)
             index = combo.findData(current)
             combo.setCurrentIndex(index if index >= 0 else 0)
             combo.setEnabled(combo.count() > 1)
@@ -5302,6 +5734,8 @@ def _build_qt_app():
             for kind, generation in self.implicit_generation_results.items():
                 if isinstance(generation.body, ImplicitBody):
                     combo.addItem(str(kind), str(kind))
+            for kind in self.backend_generation_handles:
+                combo.addItem(f"{kind}（后端）", kind)
             index = combo.findData(current)
             combo.setCurrentIndex(index if index >= 0 else 0)
             combo.blockSignals(False)
@@ -5428,13 +5862,35 @@ def _build_qt_app():
                 tile_size_px=128,
             )
 
+        def _backend_precise_render_settings(
+            self,
+            generation: BackendGenerationResult,
+        ) -> PreciseRenderSettings:
+            selection = self.precise_render_resolution_combo.currentData()
+            if selection is None:
+                width = int(self.precise_render_width.value())
+                height = int(self.precise_render_height.value())
+            else:
+                width, height = (int(value) for value in selection)
+            return PreciseRenderSettings(
+                width_px=width,
+                height_px=height,
+                minimum_feature_mm=float(
+                    max(generation.minimum_feature_mm or 1.0, 1.0e-6)
+                ),
+                tile_size_px=128,
+            )
+
         def _start_precise_render(self) -> None:
             if self.precise_render_thread is not None:
                 return
             if self._document_switch_is_locked():
                 return
             target = self._selected_precise_render_target()
-            if target is None:
+            backend_generation = self.backend_generation_handles.get(
+                self.precise_render_target_combo.currentData()
+            )
+            if target is None and backend_generation is None:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "无法精确渲染",
@@ -5442,13 +5898,17 @@ def _build_qt_app():
                 )
                 return
             try:
-                settings = self._precise_render_settings(target)
+                settings = (
+                    self._precise_render_settings(target)
+                    if target is not None
+                    else self._backend_precise_render_settings(backend_generation)
+                )
                 camera = self._precise_render_camera()
             except (TypeError, ValueError, AttributeError) as exc:
                 QtWidgets.QMessageBox.warning(self, "精确渲染参数错误", str(exc))
                 return
             default_path = self.root / "build" / "exports" / (
-                f"precise_render_{target.material_key}.png"
+                f"precise_render_{target.material_key if target is not None else backend_generation.kind}.png"
             )
             output_path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
@@ -5462,7 +5922,7 @@ def _build_qt_app():
             if document is None:
                 return
             color = self.material_colors.get(
-                target.material_key,
+                target.material_key if target is not None else backend_generation.kind,
                 self.material_colors.get("domain", MATERIAL_PRESETS["CAD 银白"]),
             )
             background = self.background_combo.currentData()
@@ -5482,6 +5942,18 @@ def _build_qt_app():
                 upper_rgb = rgb(upper_hex)
             except ValueError as exc:
                 QtWidgets.QMessageBox.warning(self, "背景颜色错误", str(exc))
+                return
+            if backend_generation is not None:
+                self._start_backend_precise_render(
+                    document,
+                    backend_generation,
+                    settings,
+                    camera,
+                    color,
+                    lower_rgb,
+                    upper_rgb,
+                    output_path,
+                )
                 return
             self.precise_render_button.setEnabled(False)
             self.generate_button.setEnabled(False)
@@ -5517,6 +5989,104 @@ def _build_qt_app():
             self.precise_render_worker.failed.connect(self.precise_render_thread.quit)
             self.precise_render_thread.finished.connect(self._precise_render_cleanup)
             self.precise_render_thread.start()
+
+        def _start_backend_precise_render(
+            self,
+            document,
+            generation: BackendGenerationResult,
+            settings: PreciseRenderSettings,
+            camera: PreciseRenderCamera,
+            color,
+            lower_rgb,
+            upper_rgb,
+            output_path: str,
+        ) -> None:
+            client = self.backend_client
+            if client is None:
+                self._precise_render_failed(
+                    document.identifier,
+                    document.revision,
+                    "local backend is unavailable",
+                )
+                return
+            payload = {
+                "generation_id": generation.generation_id,
+                "camera": asdict(camera),
+                "settings": asdict(settings),
+                "material": {
+                    "color": [float(value) for value in color],
+                    **PBR_MATERIAL_PARAMETERS.get(generation.kind, {}),
+                },
+                "background_lower": list(lower_rgb),
+                "background_upper": list(upper_rgb),
+            }
+
+            def result_reader(snapshot: object):
+                if snapshot.result is None or len(snapshot.artifacts) != 1:
+                    raise ValueError("precise render task returned an invalid artifact")
+                return snapshot.result, client.download_artifact(
+                    snapshot.artifacts[0].identifier
+                )
+
+            self.precise_render_button.setEnabled(False)
+            self.generate_button.setEnabled(False)
+            self.progress.setValue(0)
+            self.precise_render_thread = QtCore.QThread(self)
+            self.precise_render_worker = BackendTaskWorker(
+                client,
+                "render.precise",
+                payload,
+                result_reader,
+            )
+            self.precise_render_worker.moveToThread(self.precise_render_thread)
+            self.precise_render_thread.started.connect(self.precise_render_worker.run)
+            self.precise_render_worker.progress.connect(
+                lambda message, value: (
+                    self.status.setText(message),
+                    self.progress.setValue(int(value * 100)),
+                )
+            )
+            self.precise_render_worker.finished.connect(
+                lambda outcome, identifier=document.identifier, revision=document.revision,
+                kind=generation.kind, path=output_path: self._backend_precise_render_finished(
+                    identifier, revision, kind, path, outcome
+                )
+            )
+            self.precise_render_worker.failed.connect(
+                lambda message, identifier=document.identifier, revision=document.revision: self._precise_render_failed(
+                    identifier, revision, message
+                )
+            )
+            self.precise_render_worker.finished.connect(self.precise_render_thread.quit)
+            self.precise_render_worker.failed.connect(self.precise_render_thread.quit)
+            self.precise_render_thread.finished.connect(self._precise_render_cleanup)
+            self.precise_render_thread.start()
+
+        def _backend_precise_render_finished(
+            self,
+            design_identifier: str,
+            design_revision: int,
+            kind: str,
+            output_path: str,
+            outcome,
+        ) -> None:
+            if getattr(self, "_is_closing", False):
+                return
+            document = self.design_workspace.documents.get(design_identifier)
+            if document is None or document.revision != int(design_revision):
+                self.status.setText("precise render result is stale")
+                return
+            result, image = outcome
+            path = Path(output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(image)
+            report = result.get("report", {})
+            self.precise_render_info.setText(
+                f"{kind} precise render complete; backend PNG; "
+                f"hits {int(report.get('hit_pixels', 0)):,}"
+            )
+            self.progress.setValue(100)
+            self.status.setText(f"precise render saved: {path}")
 
         def _precise_render_finished(
             self,
@@ -5625,16 +6195,21 @@ def _build_qt_app():
                 return float(positions[position_index])
             body, _field = self._contour_result_fields(kind)
             generation = self.implicit_generation_results.get(kind)
-            if body is None:
+            backend_generation = self.backend_generation_handles.get(kind)
+            if body is None and backend_generation is None:
                 raise RuntimeError("当前没有可查看的隐式结果")
             axis = self.contour_axis_combo.currentText()
             index = "XYZ".index(axis)
-            bounds = body.bounds
+            bounds = (
+                body.bounds
+                if body is not None
+                else backend_generation.display_field.bounds
+            )
             positions = available_layer_positions(
                 bounds,
                 axis,
                 self._contour_layer_spacing(
-                    generation,
+                    generation or backend_generation,
                     self.contour_source_combo.currentData(),
                 ),
             )
@@ -5654,9 +6229,12 @@ def _build_qt_app():
             if kind == "domain":
                 return self.domain_implicit_body, self.domain_implicit_field
             generation = self.implicit_generation_results.get(kind)
-            if generation is None:
-                return None, None
-            return generation.body, generation.display_field
+            if generation is not None:
+                return generation.body, generation.display_field
+            backend_generation = self.backend_generation_handles.get(kind)
+            if backend_generation is not None:
+                return None, backend_generation.display_field
+            return None, None
 
         def _update_contour_layer_label(self) -> None:
             try:
@@ -5672,6 +6250,15 @@ def _build_qt_app():
                 self._refresh_layer_contours()
 
         def _on_contour_source_changed(self, _index: int = 0) -> None:
+            kind = self.contour_result_combo.currentData()
+            if (
+                kind in self.backend_generation_handles
+                and self.contour_source_combo.currentData() != "render"
+            ):
+                render_index = self.contour_source_combo.findData("render")
+                self.contour_source_combo.blockSignals(True)
+                self.contour_source_combo.setCurrentIndex(render_index)
+                self.contour_source_combo.blockSignals(False)
             self._update_contour_layer_label()
             if self.contour_enabled.isChecked():
                 self._refresh_layer_contours()
@@ -5713,13 +6300,15 @@ def _build_qt_app():
                 )
             body, _field = self._contour_result_fields(kind)
             generation = self.implicit_generation_results.get(kind)
-            if generation is None:
+            backend_generation = self.backend_generation_handles.get(kind)
+            if generation is None and backend_generation is None:
                 raise RuntimeError("当前没有可查看的隐式结果")
-            spacing = self._contour_sampling_spacing(generation, source)
+            active_generation = generation or backend_generation
+            spacing = self._contour_sampling_spacing(active_generation, source)
             return (
                 kind,
                 source,
-                id(body),
+                id(body if body is not None else backend_generation.display_field.values),
                 tuple(round(float(value), 9) for value in spacing),
                 axis,
                 bool(self.contour_fixed_layer_enabled.isChecked()),
@@ -5730,7 +6319,7 @@ def _build_qt_app():
 
         def _contour_sampling_spacing(
             self,
-            generation: ImplicitGenerationResult | None,
+            generation: ImplicitGenerationResult | BackendGenerationResult | None,
             source: ContourFieldSource,
         ) -> np.ndarray:
             if generation is None:
@@ -5742,6 +6331,8 @@ def _build_qt_app():
                     return np.full(3, float(self.export_tolerance.value()), dtype=np.float64)
                 raise RuntimeError("设计域隐式采样场尚未准备完成")
             if source in ("render", "authoritative"):
+                if isinstance(generation, BackendGenerationResult) and source != "render":
+                    raise RuntimeError("backend results expose display fields only")
                 return np.asarray(generation.display_field.spacing, dtype=np.float64)
             if source != "stl_reconstruction":
                 raise ValueError(f"未知等值线场源：{source}")
@@ -5761,7 +6352,7 @@ def _build_qt_app():
 
         def _contour_layer_spacing(
             self,
-            generation: ImplicitGenerationResult | None,
+            generation: ImplicitGenerationResult | BackendGenerationResult | None,
             source: ContourFieldSource,
         ) -> np.ndarray:
             """Return spacing used to enumerate layers.
@@ -5787,10 +6378,10 @@ def _build_qt_app():
             if self.contour_fixed_layer_enabled.isChecked():
                 return f"固定 {self.contour_fixed_layer_height.value():.4f} mm"
             try:
+                kind = self.contour_result_combo.currentData()
                 spacing = self._contour_sampling_spacing(
-                    self.implicit_generation_results.get(
-                        self.contour_result_combo.currentData()
-                    ),
+                    self.implicit_generation_results.get(kind)
+                    or self.backend_generation_handles.get(kind),
                     self.contour_source_combo.currentData(),
                 )
                 axis = self.contour_axis_combo.currentText()
@@ -5822,12 +6413,23 @@ def _build_qt_app():
                     source=source,
                 )
             generation = self.implicit_generation_results.get(kind)
-            if generation is None:
+            backend_generation = self.backend_generation_handles.get(kind)
+            if generation is None and backend_generation is None:
                 raise RuntimeError("当前没有可查看的隐式结果")
             source = self.contour_source_combo.currentData()
             axis = self.contour_axis_combo.currentText()
             position = self._contour_layer_position()
             level = float(self.contour_level.value())
+            if backend_generation is not None:
+                if source != "render":
+                    raise RuntimeError("backend results expose display fields only")
+                return sample_sampled_field_layer(
+                    backend_generation.display_field,
+                    axis,
+                    position,
+                    level=level,
+                    source=source,
+                )
             if source == "render":
                 result = sample_sampled_field_layer(
                     generation.display_field,
@@ -6062,10 +6664,36 @@ def _build_qt_app():
             if self.design_workspace.active_document is not None:
                 self._store_active_design_state()
             if create_design or self.design_workspace.active_document is None:
+                document_identifier = self.design_workspace.new_identifier()
+                document_name = path.stem or "STL design"
+                initial_settings = self._new_design_document_settings()
+                if not self._backend_apply_workspace_commands(
+                    [
+                        {
+                            "kind": "document.create.mesh",
+                            "document_id": document_identifier,
+                            "name": document_name,
+                            "domain_name": document_name,
+                            "source_path": str(path.resolve()),
+                        },
+                        {
+                            "kind": "document.settings.replace",
+                            "document_id": document_identifier,
+                            "settings": initial_settings,
+                        },
+                        {
+                            "kind": "document.field_scene.replace",
+                            "document_id": document_identifier,
+                            "field_primitives": [],
+                        },
+                    ]
+                ):
+                    return
                 document = self.design_workspace.create_mesh_document(
                     loaded_mesh,
-                    path.stem or "STL 设计",
+                    document_name,
                     asset_path=path,
+                    identifier=document_identifier,
                 )
                 self._initialize_new_design_document(document)
                 self._restore_active_design_state()
@@ -6081,6 +6709,17 @@ def _build_qt_app():
             else:
                 document = self.design_workspace.active_document
                 assert document is not None
+                if not self._backend_apply_workspace_commands(
+                    [
+                        {
+                            "kind": "document.replace.mesh",
+                            "document_id": document.identifier,
+                            "domain_name": document.name,
+                            "source_path": str(path.resolve()),
+                        }
+                    ]
+                ):
+                    return
                 document.replace_domain(
                     MeshDesignDomain(
                         mesh=loaded_mesh,
@@ -6098,6 +6737,7 @@ def _build_qt_app():
             self.results = {}
             self.implicit_results = {}
             self.implicit_generation_results = {}
+            self.backend_generation_handles = {}
             self.implicit_fields = {}
             self.stl_reconstruction_results = {}
             contour_cache = self.__dict__.get("_layer_contour_cache")
@@ -6272,10 +6912,31 @@ def _build_qt_app():
             document = self.design_workspace.active_document
             if document is None:
                 return
-            if document.replace_field_object_scene(
-                self.field_primitives,
-                self.field_primitive_visibility,
+            if (
+                document.field_primitives != self.field_primitives
+                or document.field_primitive_visibility
+                != {
+                    key: bool(value)
+                    for key, value in self.field_primitive_visibility.items()
+                }
             ):
+                if not self._backend_apply_workspace_commands(
+                    [
+                        {
+                            "kind": "document.field_scene.replace",
+                            "document_id": document.identifier,
+                            "field_primitives": self._backend_field_scene_payload(
+                                self.field_primitives,
+                                self.field_primitive_visibility,
+                            ),
+                        }
+                    ]
+                ):
+                    return
+                document.replace_field_object_scene(
+                    self.field_primitives,
+                    self.field_primitive_visibility,
+                )
                 self.design_workspace.dirty = True
 
         def _transition_driver_mode(self) -> TransitionDriverMode:
@@ -6432,6 +7093,22 @@ def _build_qt_app():
             self.field_primitive_visibility[identifier] = bool(visible)
             document = self.design_workspace.active_document
             if document is not None and not self._workspace_loading:
+                if not self._backend_apply_workspace_commands(
+                    [
+                        {
+                            "kind": "document.field.visibility.set",
+                            "document_id": document.identifier,
+                            "primitive_id": identifier,
+                            "visible": bool(visible),
+                        }
+                    ]
+                ):
+                    self.field_primitive_visibility[identifier] = document.field_primitive_visibility.get(
+                        identifier,
+                        True,
+                    )
+                    self._sync_field_primitive_editor()
+                    return
                 document.set_field_primitive_visibility(identifier, visible)
                 self.design_workspace.dirty = True
             self._refresh_primitive_preview(sync_gizmo=True)
@@ -6475,6 +7152,17 @@ def _build_qt_app():
                 != primitive.identifier
             ):
                 return
+            if not self._backend_apply_workspace_commands(
+                [
+                    {
+                        "kind": "document.replace.analytic",
+                        "document_id": document.identifier,
+                        "domain_name": document.name,
+                        "primitive": asdict(primitive),
+                    }
+                ]
+            ):
+                return
             document.replace_domain(
                 AnalyticDesignDomain(primitive=primitive, name=document.name)
             )
@@ -6484,6 +7172,7 @@ def _build_qt_app():
             self._shell_fusion_domain_field = None
             self.implicit_results = {}
             self.implicit_generation_results = {}
+            self.backend_generation_handles = {}
             self.implicit_fields = {}
             self.raw_results = {}
             self.repaired_results = {}
@@ -7077,9 +7766,21 @@ def _build_qt_app():
             has_analytic_domain_target = (
                 self._analytic_design_reconstruction_target() is not None
             )
-            if not self.implicit_generation_results and not has_analytic_domain_target:
+            selected_backend = self.backend_generation_handles.get(
+                self.stl_reconstruction_target_combo.currentData()
+            )
+            if (
+                not self.implicit_generation_results
+                and not self.backend_generation_handles
+                and not has_analytic_domain_target
+            ):
                 self.export_grid_info.setText(
                     "生成隐式体或创建解析设计域后显示 STL 网格尺寸和总体素数"
+                )
+                return
+            if selected_backend is not None:
+                self.export_grid_info.setText(
+                    "当前对象由本地后端持有；重建时将在后端按所选容差计算网格"
                 )
                 return
             if not selected_targets:
@@ -7893,6 +8594,7 @@ def _build_qt_app():
             self.results = {}
             self.implicit_results = {}
             self.implicit_generation_results = {}
+            self.backend_generation_handles = {}
             self.implicit_fields = {}
             self.domain_implicit_field = None
             self._shell_fusion_domain_field = None
@@ -8003,6 +8705,13 @@ def _build_qt_app():
             self._refresh_scene(reset_view=False)
 
         def _start_stl_reconstruction(self, repair: bool):
+            backend_generation = self.backend_generation_handles.get(
+                self.stl_reconstruction_target_combo.currentData()
+            )
+            if backend_generation is not None:
+                if self.stl_thread is None:
+                    self._start_backend_stl_reconstruction(backend_generation, repair)
+                return
             selected_results = self._selected_stl_reconstruction_results()
             if not selected_results or self.stl_thread is not None:
                 if (
@@ -8048,6 +8757,121 @@ def _build_qt_app():
             self.stl_worker.failed.connect(self.stl_thread.quit)
             self.stl_thread.finished.connect(self._stl_reconstruction_cleanup)
             self.stl_thread.start()
+
+        def _start_backend_stl_reconstruction(
+            self,
+            generation: BackendGenerationResult,
+            repair: bool,
+        ) -> None:
+            """Reconstruct a backend handle without returning an implicit body."""
+
+            client = self.backend_client
+            if client is None:
+                self._stl_reconstruction_failed("local backend is unavailable")
+                return
+            sampling = self._current_sampling()
+            payload = {
+                "generation_id": generation.generation_id,
+                "tolerance_mm": float(self.export_tolerance.value()),
+                "repair_tolerance_mm": (
+                    float(self.repair_tolerance.value()) if repair else 0.0
+                ),
+                "spacing_mode": self._export_spacing_mode(),
+                "clean_numerical_fragments": self.clean_numerical_fragments.isChecked(),
+                "processing_mode": sampling.processing_mode,
+                "batch_count": sampling.batch_count,
+                "optimize_for_slicing": self.optimize_stl_for_slicing.isChecked(),
+            }
+
+            def result_reader(snapshot: object) -> BackendStlReconstructionResult:
+                if snapshot.result is None:
+                    raise ValueError("reconstruction task returned no result")
+                artifacts = snapshot.artifacts
+                if len(artifacts) != 1 or artifacts[0].name != "lattice.stl":
+                    raise ValueError("reconstruction task must publish lattice.stl")
+                mesh = trimesh.load_mesh(
+                    BytesIO(client.download_artifact(artifacts[0].identifier)),
+                    file_type="stl",
+                    process=False,
+                )
+                if not isinstance(mesh, trimesh.Trimesh):
+                    raise ValueError("reconstruction artifact is not a triangular mesh")
+                return BackendStlReconstructionResult(
+                    kind=generation.kind,
+                    mesh=mesh,
+                    triangle_count=int(snapshot.result["triangle_count"]),
+                )
+
+            self.build_stl_button.setEnabled(False)
+            self.repair_result_button.setEnabled(False)
+            self.stl_reconstruction_target_combo.setEnabled(False)
+            self.progress.setValue(0)
+            self.status.setText("正在由本地后端重建 STL……")
+            self.stl_thread = QtCore.QThread(self)
+            self.stl_worker = BackendTaskWorker(
+                client,
+                "stl.reconstruct",
+                payload,
+                result_reader,
+            )
+            self.stl_worker.moveToThread(self.stl_thread)
+            self.stl_thread.started.connect(self.stl_worker.run)
+            self.stl_worker.progress.connect(
+                lambda message, value: (
+                    self.status.setText(message),
+                    self.progress.setValue(int(value * 100)),
+                )
+            )
+            self.stl_worker.finished.connect(
+                lambda result, mode=repair: self._backend_stl_reconstruction_finished(
+                    result,
+                    mode,
+                )
+            )
+            self.stl_worker.failed.connect(self._stl_reconstruction_failed)
+            self.stl_worker.finished.connect(self.stl_thread.quit)
+            self.stl_worker.failed.connect(self.stl_thread.quit)
+            self.stl_thread.finished.connect(self._stl_reconstruction_cleanup)
+            self.stl_thread.start()
+
+        def _backend_stl_reconstruction_finished(
+            self,
+            result: BackendStlReconstructionResult,
+            repair: bool,
+        ) -> None:
+            if getattr(self, "_is_closing", False):
+                return
+            self._layer_contour_cache.clear()
+            self._field_plane_cache.clear()
+            mesh = result.mesh.copy()
+            self.stl_reconstruction_results = {}
+            if repair:
+                self.repaired_results = {result.kind: mesh}
+                self.use_repaired_result.setEnabled(True)
+                self.use_repaired_result.setChecked(True)
+            else:
+                self.raw_results = {result.kind: mesh}
+                self.repaired_results = {}
+                self.use_repaired_result.blockSignals(True)
+                self.use_repaired_result.setChecked(False)
+                self.use_repaired_result.blockSignals(False)
+                self.use_repaired_result.setEnabled(False)
+            self._select_result_variant(self.use_repaired_result.isChecked())
+            self.view_stl_mesh.setEnabled(True)
+            self.view_stl_mesh.setChecked(True)
+            self.show_stl_edges.setEnabled(True)
+            self.progress.setValue(100)
+            self._stl_sampling_summary = (
+                f"STL 重建：{result.kind}；后端产物；"
+                f"三角面 {result.triangle_count:,}"
+            )
+            self._refresh_applied_sampling_info()
+            self.status.setText(
+                f"后端 STL 重建完成：{result.kind}；三角面 {result.triangle_count:,}"
+            )
+            self._set_result_controls_enabled(True)
+            self._refresh_scene(reset_view=True)
+            self._store_active_design_state()
 
         def _stl_reconstruction_finished(self, outputs, repair: bool):
             if getattr(self, "_is_closing", False):
@@ -8480,10 +9304,25 @@ def _build_qt_app():
             except ValueError as exc:
                 QtWidgets.QMessageBox.warning(self, "参数错误", str(exc))
                 return
+            backend_payload = self._backend_generation_payload(
+                document,
+                jobs,
+                sampling,
+                transition_job,
+                display_voxel_size,
+                display_budget_mb,
+                display_batch_count,
+            )
             self.generate_button.setEnabled(False)
             self.progress.setValue(0)
             self.status.setText("正在计算，请稍候……")
             self.thread = QtCore.QThread(self)
+            if backend_payload is not None:
+                self._start_backend_generation(
+                    document,
+                    backend_payload,
+                )
+                return
             self.worker = GenerationWorker(
                 mesh=self.sole_mesh.copy(),
                 jobs=jobs,
@@ -8510,6 +9349,362 @@ def _build_qt_app():
             self.worker.failed.connect(self.thread.quit)
             self.thread.finished.connect(self._generation_cleanup)
             self.thread.start()
+
+        def _backend_generation_payload(
+            self,
+            document,
+            jobs: dict[str, LatticeParameters],
+            sampling: SamplingParameters,
+            transition_job,
+            display_voxel_size_mm: float | None,
+            display_memory_budget_mb: float,
+            display_batch_count: int | None,
+        ) -> dict[str, object] | None:
+            """Build one or many serialized-design requests for the backend task API."""
+
+            if self.backend_client is None or not isinstance(
+                document.domain, (MeshDesignDomain, AnalyticDesignDomain)
+            ):
+                return None
+            task_kind = None
+            parameters_payload = None
+            if len(jobs) == 1 and transition_job is None:
+                parameters = next(iter(jobs.values()))
+                parameters_payload = asdict(parameters)
+                if isinstance(parameters, TPMSParameters):
+                    task_kind = "tpms.generate"
+                elif isinstance(parameters, CustomUnitCellParameters):
+                    task_kind = "custom.generate"
+                    parameters_payload["source_path"] = str(
+                        self._workspace_asset_source_path(parameters.source_path)
+                    )
+            elif not jobs and transition_job is not None and len(transition_job) in (3, 4):
+                first, second, transition = transition_job[:3]
+                task_kind = "transition.generate"
+                parameters_payload = {
+                    "first_parameters": _backend_lattice_parameters_payload(
+                        first,
+                        self._workspace_asset_source_path,
+                    ),
+                    "second_parameters": _backend_lattice_parameters_payload(
+                        second,
+                        self._workspace_asset_source_path,
+                    ),
+                    "transition": asdict(transition),
+                }
+                if transition.driver_mode == "field":
+                    primitive = self.field_primitives.get(transition.driver_identifier)
+                    if primitive is None:
+                        return None
+                    parameters_payload["driver_primitive"] = asdict(primitive)
+
+            input_root: Path | None = None
+            domain_payload: dict[str, object] | None = None
+            if isinstance(document.domain, MeshDesignDomain):
+                input_root = Path(mkdtemp(prefix="lattice-studio-backend-"))
+                mesh_path = input_root / "design-domain.stl"
+                try:
+                    # The child process reads a fresh snapshot. It must not depend
+                    # on a possibly stale source asset after interactive repairs.
+                    self.sole_mesh.export(mesh_path)
+                except Exception:
+                    rmtree(input_root, ignore_errors=True)
+                    raise
+                mesh_path_value: str | None = str(mesh_path)
+                domain_payload = {
+                    "kind": "mesh",
+                    "name": document.domain.name,
+                    "source_path": mesh_path_value,
+                }
+            else:
+                mesh_path_value = None
+                domain_payload = {
+                    "kind": "analytic",
+                    "name": document.domain.name,
+                    "primitive": asdict(document.domain.primitive),
+                }
+            common_payload = {
+                "sampling": asdict(sampling),
+                "display_voxel_size_mm": display_voxel_size_mm,
+                "display_memory_budget_mb": display_memory_budget_mb,
+                "display_batch_count": display_batch_count,
+            }
+            if mesh_path_value is not None:
+                common_payload["mesh_path"] = mesh_path_value
+            if domain_payload is not None:
+                common_payload["domain"] = domain_payload
+            if task_kind is not None and parameters_payload is not None:
+                self._backend_generation_input_root = input_root
+                payload = dict(common_payload)
+                if task_kind == "transition.generate":
+                    payload.update(parameters_payload)
+                else:
+                    payload["parameters"] = parameters_payload
+                payload["_task_kind"] = task_kind
+                return payload
+
+            requests = []
+            for kind, parameters in jobs.items():
+                if isinstance(parameters, TPMSParameters):
+                    request_kind = "tpms.generate"
+                elif isinstance(parameters, CustomUnitCellParameters):
+                    request_kind = "custom.generate"
+                else:
+                    if input_root is not None:
+                        rmtree(input_root, ignore_errors=True)
+                    return None
+                request_payload = dict(common_payload)
+                request_payload["parameters"] = _backend_lattice_parameters_payload(
+                    parameters,
+                    self._workspace_asset_source_path,
+                )
+                requests.append(
+                    {
+                        "request_id": str(kind),
+                        "kind": request_kind,
+                        "payload": request_payload,
+                    }
+                )
+            if transition_job is not None and len(transition_job) in (3, 4):
+                first, second, transition = transition_job[:3]
+                transition_payload = {
+                    **common_payload,
+                    "first_parameters": _backend_lattice_parameters_payload(
+                        first, self._workspace_asset_source_path
+                    ),
+                    "second_parameters": _backend_lattice_parameters_payload(
+                        second, self._workspace_asset_source_path
+                    ),
+                    "transition": asdict(transition),
+                }
+                if transition.driver_mode == "field":
+                    primitive = self.field_primitives.get(transition.driver_identifier)
+                    if primitive is None:
+                        if input_root is not None:
+                            rmtree(input_root, ignore_errors=True)
+                        return None
+                    transition_payload["driver_primitive"] = asdict(primitive)
+                requests.append(
+                    {
+                        "request_id": "Transition",
+                        "kind": "transition.generate",
+                        "payload": transition_payload,
+                    }
+                )
+            if len(requests) < 2:
+                if input_root is not None:
+                    rmtree(input_root, ignore_errors=True)
+                return None
+            self._backend_generation_input_root = input_root
+            return {"_task_kind": "generation.batch", "requests": requests}
+
+        def _start_backend_generation(
+            self,
+            document,
+            payload: dict[str, object],
+        ) -> None:
+            """Run one supported generation request through the loopback backend."""
+
+            client = self.backend_client
+            if client is None:
+                raise RuntimeError("local backend is unavailable")
+            task_kind = str(payload.pop("_task_kind", "tpms.generate"))
+
+            def result_reader(snapshot: object):
+                if task_kind == "generation.batch":
+                    artifact_ids = batch_display_field_artifact_ids(snapshot)
+                    return read_generation_batch(
+                        snapshot,
+                        {
+                            request_id: client.download_artifact(artifact_id)
+                            for request_id, artifact_id in artifact_ids.items()
+                        },
+                    )
+                artifact_id = display_field_artifact_id(snapshot)
+                return read_generation_result(
+                    snapshot,
+                    client.download_artifact(artifact_id),
+                )
+
+            self.worker = BackendTaskWorker(
+                client,
+                task_kind,
+                payload,
+                result_reader,
+            )
+            self.worker.moveToThread(self.thread)
+            self.thread.started.connect(self.worker.run)
+            self.worker.progress.connect(
+                lambda message, value: (
+                    self.status.setText(message),
+                    self.progress.setValue(int(value * 100)),
+                )
+            )
+            if task_kind == "generation.batch":
+                self.worker.finished.connect(
+                    lambda result, identifier=document.identifier, revision=document.revision: self._backend_generation_batch_finished(
+                        identifier, revision, result
+                    )
+                )
+            else:
+                self.worker.finished.connect(
+                    lambda result, identifier=document.identifier, revision=document.revision: self._backend_generation_finished(
+                        identifier,
+                        revision,
+                        result,
+                    )
+                )
+            self.worker.failed.connect(
+                lambda message, identifier=document.identifier, revision=document.revision: self._generation_failed(
+                    identifier,
+                    revision,
+                    message,
+                )
+            )
+            self.worker.finished.connect(self.thread.quit)
+            self.worker.failed.connect(self.thread.quit)
+            self.thread.finished.connect(self._generation_cleanup)
+            self.thread.start()
+
+        def _backend_generation_batch_finished(
+            self,
+            design_identifier: str,
+            design_revision: int,
+            generations: dict[str, BackendGenerationResult],
+        ) -> None:
+            """Store several opaque generation handles from one backend task."""
+
+            if getattr(self, "_is_closing", False):
+                return
+            document = self.design_workspace.documents.get(design_identifier)
+            if document is None or document.revision != design_revision:
+                if self.design_workspace.active_design_id == design_identifier:
+                    self.status.setText("设计已修改；已丢弃过期的生成结果。")
+                return
+            runtime = document.runtime
+            runtime.implicit_generation_results = {}
+            runtime.implicit_results = {}
+            runtime.backend_generation_handles = dict(generations)
+            runtime.implicit_fields = {
+                kind: generation.display_field for kind, generation in generations.items()
+            }
+            runtime.raw_results = {}
+            runtime.repaired_results = {}
+            runtime.results = {}
+            runtime.stl_reconstruction_results = {}
+            runtime.renderer_cache.clear()
+            if self.design_workspace.active_design_id != design_identifier:
+                self.design_workspace.dirty = True
+                return
+            self._layer_contour_cache.clear()
+            self._field_plane_cache.clear()
+            self.implicit_generation_results = {}
+            self.implicit_results = {}
+            self.backend_generation_handles = dict(generations)
+            self.implicit_fields = {
+                kind: generation.display_field for kind, generation in generations.items()
+            }
+            self.stl_reconstruction_results = {}
+            self.raw_results = {}
+            self.repaired_results = {}
+            self.results = {}
+            self.show_domain.blockSignals(True)
+            self.show_domain.setChecked(False)
+            self.show_domain.blockSignals(False)
+            self._sync_contour_result_options()
+            self._sync_field_viewer_options()
+            self._sync_stl_reconstruction_target_options()
+            self._sync_section_target_options()
+            self._sync_shell_lattice_options()
+            self._set_result_controls_enabled(False)
+            self.view_stl_mesh.setChecked(False)
+            self.view_stl_mesh.setEnabled(False)
+            self.show_stl_edges.setChecked(False)
+            self.show_stl_edges.setEnabled(False)
+            self.use_repaired_result.setChecked(False)
+            self.use_repaired_result.setEnabled(False)
+            self.progress.setValue(100)
+            self.status.setText(f"完成后端隐式显示：{', '.join(generations)}")
+            self._refresh_compute_backend_info()
+            if self.field_viewer_enabled.isChecked():
+                self.field_viewer_enabled.setChecked(False)
+            self._refresh_scene(reset_view=True)
+            self._store_active_design_state()
+
+        def _backend_generation_finished(
+            self,
+            design_identifier: str,
+            design_revision: int,
+            generation: BackendGenerationResult,
+        ) -> None:
+            """Store only a display cache and opaque handle in the Qt process."""
+
+            if getattr(self, "_is_closing", False):
+                return
+            document = self.design_workspace.documents.get(design_identifier)
+            if document is None or document.revision != design_revision:
+                if self.design_workspace.active_design_id == design_identifier:
+                    self.status.setText("设计已修改；已丢弃过期的生成结果。")
+                return
+            runtime = document.runtime
+            runtime.implicit_generation_results = {}
+            runtime.implicit_results = {}
+            runtime.backend_generation_handles = {generation.kind: generation}
+            runtime.implicit_fields = {generation.kind: generation.display_field}
+            runtime.raw_results = {}
+            runtime.repaired_results = {}
+            runtime.results = {}
+            runtime.stl_reconstruction_results = {}
+            runtime.renderer_cache.clear()
+            if self.design_workspace.active_design_id != design_identifier:
+                self.design_workspace.dirty = True
+                return
+
+            self._layer_contour_cache.clear()
+            self._field_plane_cache.clear()
+            self.implicit_generation_results = {}
+            self.implicit_results = {}
+            self.backend_generation_handles = {generation.kind: generation}
+            self.implicit_fields = {generation.kind: generation.display_field}
+            self.stl_reconstruction_results = {}
+            self.raw_results = {}
+            self.repaired_results = {}
+            self.results = {}
+            document.runtime.renderer_cache.clear()
+            self.show_domain.blockSignals(True)
+            self.show_domain.setChecked(False)
+            self.show_domain.blockSignals(False)
+            self._sync_contour_result_options()
+            self._sync_field_viewer_options()
+            self._sync_stl_reconstruction_target_options()
+            self._sync_section_target_options()
+            self._sync_shell_lattice_options()
+            self._set_result_controls_enabled(False)
+            self.view_stl_mesh.setChecked(False)
+            self.view_stl_mesh.setEnabled(False)
+            self.show_stl_edges.setChecked(False)
+            self.show_stl_edges.setEnabled(False)
+            self.use_repaired_result.setChecked(False)
+            self.use_repaired_result.setEnabled(False)
+            field = generation.display_field
+            self._implicit_sampling_summary = describe_display_sampling(
+                generation.kind,
+                field,
+                generation.recommendation,
+                None,
+            )
+            self._stl_sampling_summary = "STL 重建：尚未生成"
+            self._refresh_applied_sampling_info()
+            self.progress.setValue(100)
+            self.status.setText(
+                f"完成后端隐式显示：{generation.kind} "
+                f"{field.values.shape[0]}x{field.values.shape[1]}x{field.values.shape[2]}"
+            )
+            self._refresh_compute_backend_info()
+            if self.field_viewer_enabled.isChecked():
+                self.field_viewer_enabled.setChecked(False)
+            self._refresh_scene(reset_view=True)
+            self._store_active_design_state()
 
         def _store_background_generation_results(
             self,
@@ -8760,12 +9955,20 @@ def _build_qt_app():
                 )
                 return
             lattice_generation = None
+            backend_lattice_generation = None
             if combine:
                 lattice_kind = self.shell_lattice_combo.currentData()
                 lattice_generation = self.implicit_generation_results.get(lattice_kind)
-                if lattice_generation is None or lattice_kind in (
+                backend_lattice_generation = self.backend_generation_handles.get(
+                    lattice_kind
+                )
+                if (
+                    lattice_generation is None
+                    and backend_lattice_generation is None
+                    or lattice_kind in (
                     SHELL_RESULT_KEY,
                     SHELL_UNION_RESULT_KEY,
+                    )
                 ):
                     QtWidgets.QMessageBox.warning(
                         self,
@@ -8779,6 +9982,16 @@ def _build_qt_app():
                 display_batch_count = self._display_sampling_batch_count()
             except ValueError as exc:
                 QtWidgets.QMessageBox.warning(self, "参数错误", str(exc))
+                return
+            if self.backend_client is not None and (
+                not combine or backend_lattice_generation is not None
+            ):
+                self._start_backend_shell_generation(
+                    combine,
+                    sampling,
+                    display_batch_count,
+                    backend_lattice_generation,
+                )
                 return
             self.shell_generate_button.setEnabled(False)
             self.shell_union_button.setEnabled(False)
@@ -8817,6 +10030,111 @@ def _build_qt_app():
             self.shell_worker.failed.connect(self.shell_thread.quit)
             self.shell_thread.finished.connect(self._shell_generation_cleanup)
             self.shell_thread.start()
+
+        def _start_backend_shell_generation(
+            self,
+            combine: bool,
+            sampling: SamplingParameters,
+            display_batch_count: int | None,
+            lattice_generation: BackendGenerationResult | None,
+        ) -> None:
+            client = self.backend_client
+            if client is None:
+                return
+            input_root = Path(mkdtemp(prefix="lattice-studio-backend-shell-"))
+            mesh_path = input_root / "design-domain.stl"
+            try:
+                self.sole_mesh.export(mesh_path)
+            except Exception:
+                rmtree(input_root, ignore_errors=True)
+                raise
+            self._backend_shell_input_root = input_root
+            kind = "shell.union" if combine else "shell.generate"
+            payload: dict[str, object] = {
+                "mesh_path": str(mesh_path),
+                "thickness_mm": float(self.shell_thickness.value()),
+                "sampling": asdict(sampling),
+                "display_voxel_size_mm": self._display_voxel_size(),
+                "display_memory_budget_mb": self._display_memory_budget_mb(),
+                "display_batch_count": display_batch_count,
+            }
+            result_key = SHELL_UNION_RESULT_KEY if combine else SHELL_RESULT_KEY
+            if combine:
+                assert lattice_generation is not None
+                payload.update(
+                    {
+                        "generation_id": lattice_generation.generation_id,
+                        "fusion_radius_mm": float(self.shell_fusion_radius.value()),
+                    }
+                )
+
+            def result_reader(snapshot: object) -> BackendGenerationResult:
+                return read_generation_result(
+                    snapshot,
+                    client.download_artifact(display_field_artifact_id(snapshot)),
+                )
+
+            self.shell_generate_button.setEnabled(False)
+            self.shell_union_button.setEnabled(False)
+            self.progress.setValue(0)
+            self.shell_thread = QtCore.QThread(self)
+            self.shell_worker = BackendTaskWorker(client, kind, payload, result_reader)
+            self.shell_worker.moveToThread(self.shell_thread)
+            self.shell_thread.started.connect(self.shell_worker.run)
+            self.shell_worker.progress.connect(
+                lambda message, value: (
+                    self.status.setText(message),
+                    self.shell_status.setText(message),
+                    self.progress.setValue(int(value * 100)),
+                )
+            )
+            self.shell_worker.finished.connect(
+                lambda result, target=result_key: self._backend_shell_generation_finished(
+                    target, result
+                )
+            )
+            self.shell_worker.failed.connect(self._shell_generation_failed)
+            self.shell_worker.finished.connect(self.shell_thread.quit)
+            self.shell_worker.failed.connect(self.shell_thread.quit)
+            self.shell_thread.finished.connect(self._shell_generation_cleanup)
+            self.shell_thread.start()
+
+        def _backend_shell_generation_finished(
+            self,
+            kind: str,
+            generation: BackendGenerationResult,
+        ) -> None:
+            if getattr(self, "_is_closing", False):
+                return
+            self._layer_contour_cache.clear()
+            self._field_plane_cache.clear()
+            targets = (
+                (SHELL_RESULT_KEY, SHELL_UNION_RESULT_KEY)
+                if kind == SHELL_RESULT_KEY
+                else (SHELL_UNION_RESULT_KEY,)
+            )
+            for target in targets:
+                self.implicit_generation_results.pop(target, None)
+                self.implicit_results.pop(target, None)
+                self.backend_generation_handles.pop(target, None)
+                self.implicit_fields.pop(target, None)
+            self.backend_generation_handles[kind] = generation
+            self.implicit_fields[kind] = generation.display_field
+            self.stl_reconstruction_results = {}
+            self.raw_results = {}
+            self.repaired_results = {}
+            self.results = {}
+            self._sync_contour_result_options()
+            self._sync_field_viewer_options()
+            self._sync_stl_reconstruction_target_options()
+            self._sync_section_target_options()
+            self._sync_shell_lattice_options()
+            self._set_result_controls_enabled(False)
+            self.progress.setValue(100)
+            self.status.setText(f"backend {kind} generation complete")
+            self.shell_status.setText(self.status.text())
+            self._refresh_scene(reset_view=True)
+            self._store_active_design_state()
 
         def _shell_generation_finished(
             self,
@@ -8914,6 +10232,10 @@ def _build_qt_app():
             QtWidgets.QMessageBox.critical(self, "抽壳或融合失败", message)
 
         def _shell_generation_cleanup(self) -> None:
+            input_root = self._backend_shell_input_root
+            self._backend_shell_input_root = None
+            if input_root is not None:
+                rmtree(input_root, ignore_errors=True)
             self.shell_worker = None
             self.shell_thread = None
             self._sync_shell_lattice_options()
@@ -8950,6 +10272,10 @@ def _build_qt_app():
             self.render_backend_info.setText(text)
 
         def _generation_cleanup(self):
+            input_root = self._backend_generation_input_root
+            self._backend_generation_input_root = None
+            if input_root is not None:
+                rmtree(input_root, ignore_errors=True)
             self.worker = None
             self.thread = None
             self.generate_button.setEnabled(
@@ -9106,16 +10432,17 @@ def _build_qt_app():
             visible_count = len(sources)
             cache = self._display_refinement_cache()
             targets = {}
+            backend_targets = {}
             for kind, body, source in sources:
-                if body is None:
-                    continue
                 cache_key = self._display_refinement_cache_key(
                     kind,
                     source,
                     visible_count,
                     quality,
                 )
-                if cache_key not in cache:
+                if cache_key in cache:
+                    continue
+                if body is not None:
                     targets[cache_key] = (
                         body,
                         source,
@@ -9124,7 +10451,28 @@ def _build_qt_app():
                             visible_count,
                         ),
                     )
+                else:
+                    generation = self.backend_generation_handles.get(kind)
+                    if generation is not None:
+                        backend_targets[cache_key] = (
+                            generation,
+                            self._display_refinement_field_budget_mb(
+                                source,
+                                visible_count,
+                            ),
+                        )
             if not targets:
+                if backend_targets:
+                    cache_key, (generation, field_budget_mb) = next(
+                        iter(backend_targets.items())
+                    )
+                    self._start_backend_display_refinement(
+                        document,
+                        cache_key,
+                        generation,
+                        field_budget_mb,
+                        quality,
+                    )
                 return
 
             self._display_refinement_refresh_pending = False
@@ -9168,6 +10516,88 @@ def _build_qt_app():
             )
             self.status.setText(
                 f"正在从权威隐式体构建{DISPLAY_QUALITY_LABELS[quality]}显示场……"
+            )
+            self.progress.setValue(0)
+            self.display_refinement_thread.start()
+
+        def _start_backend_display_refinement(
+            self,
+            document,
+            cache_key: object,
+            generation: BackendGenerationResult,
+            field_budget_mb: float,
+            quality: str,
+        ) -> None:
+            client = self.backend_client
+            if client is None:
+                return
+            payload = {
+                "generation_id": generation.generation_id,
+                "quality": quality,
+                "display_memory_budget_mb": field_budget_mb,
+                "display_batch_count": self._display_sampling_batch_count(),
+            }
+
+            def result_reader(snapshot: object):
+                if snapshot.result is None:
+                    raise ValueError("display refinement task returned no result")
+                report = DisplayRefinementReport(**snapshot.result["report"])
+                return (
+                    read_sampled_field(
+                        client.download_artifact(display_field_artifact_id(snapshot))
+                    ),
+                    report,
+                )
+
+            self._display_refinement_refresh_pending = False
+            self.display_refinement_thread = QtCore.QThread(self)
+            self.display_refinement_worker = BackendTaskWorker(
+                client,
+                "display.refine",
+                payload,
+                result_reader,
+            )
+            self.display_refinement_worker.moveToThread(
+                self.display_refinement_thread
+            )
+            self.display_refinement_thread.started.connect(
+                self.display_refinement_worker.run
+            )
+            self.display_refinement_worker.progress.connect(
+                lambda message, value, identifier=document.identifier,
+                revision=document.revision: self._display_refinement_progress(
+                    identifier,
+                    revision,
+                    message,
+                    value,
+                )
+            )
+            self.display_refinement_worker.finished.connect(
+                lambda outcome, identifier=document.identifier,
+                revision=document.revision, requested=quality, key=cache_key: self._display_refinement_finished(
+                    identifier,
+                    revision,
+                    requested,
+                    {key: outcome},
+                )
+            )
+            self.display_refinement_worker.failed.connect(
+                lambda message, identifier=document.identifier,
+                revision=document.revision, requested=quality: self._display_refinement_failed(
+                    identifier,
+                    revision,
+                    requested,
+                    message,
+                )
+            )
+            self.display_refinement_worker.finished.connect(
+                self.display_refinement_thread.quit
+            )
+            self.display_refinement_worker.failed.connect(
+                self.display_refinement_thread.quit
+            )
+            self.display_refinement_thread.finished.connect(
+                self._display_refinement_cleanup
             )
             self.progress.setValue(0)
             self.display_refinement_thread.start()

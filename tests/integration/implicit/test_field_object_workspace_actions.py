@@ -75,6 +75,20 @@ def test_preview_toggle_preserves_transition_and_revision(window, dual_role):
             assert document.domain is domain
             assert document.revision == revision
             assert document.field_primitive_visibility[identifier] is visible
+            snapshot = window.backend_client.get_workspace_snapshot(
+                window.backend_workspace_id
+            )
+            backend_document = next(
+                item
+                for item in snapshot["documents"]
+                if item["document_id"] == document.identifier
+            )
+            backend_field = next(
+                item
+                for item in backend_document["field_primitives"]
+                if item["primitive"]["identifier"] == identifier
+            )
+            assert backend_field["visible"] is visible
             window._refresh_scene()
             assert window.viewer.scene_geometry_updates[-1][1]
         sample_domain.assert_not_called()
