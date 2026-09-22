@@ -1,5 +1,55 @@
 # Project-Handoff
 
+## 2026-09-22 Local Backend Separation Update
+
+Current branch: `feature/local-backend-separation`.
+
+The baseline backup commit is `5244b11`; the initial workspace-loopback
+foundation is `c896de3`; the current branch tip contains the backend task
+stage. It adds:
+
+- `application.tasks` owns asynchronous task state, cancellation, progress,
+  and backend-managed artifacts.
+- `presentation.http.local_backend` exposes task submission, polling,
+  cancellation, and artifact download on `127.0.0.1` only.
+- `presentation.http.backend_process` starts and stops the desktop-owned local
+  backend child process. It is invoked by the Qt workbench lifecycle.
+- `application.backend_workflows` implements backend-owned `tpms.generate`
+  and `stl.reconstruct`; the generation handle remains authoritative in the
+  backend and the client receives a display-field NPZ or STL artifact.
+
+Verified in this workspace:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\integration\test_local_backend_api.py tests\integration\test_local_backend_tasks.py tests\integration\test_workbench_shutdown.py -q
+.\.venv\Scripts\python.exe -m compileall -q src
+```
+
+The task tests cover success, failure, cancellation, binary artifact download,
+backend child-process lifecycle, and a real TPMS-to-STL vertical workflow.
+
+Remaining risk: the Qt workbench still uses in-process workers for custom-cell,
+transition, shell/fusion, display refinement, precise rendering, and its
+runtime workspace model. Do not transfer `ImplicitBody`, VTK, Qt, CUDA, or
+trimesh objects across HTTP; complete those migrations through backend handles
+and derived artifacts as specified in ADR 0035.
+
+Packaging evidence for this backend-task stage: `packaging/build_onedir.ps1` and
+`packaging/build_installer.ps1` completed; the rebuilt onedir executable was
+started with `--serve-backend` and returned the task protocol health payload.
+`packaging/verify_installer.ps1` completed in
+`build/installer-acceptance-backend-20260922-122300`: GPU runtime, explicitly
+disabled CUDA CPU fallback, window open/close, and uninstall all passed. A
+future migration of the remaining UI workflows must rebuild and verify again.
+
+Full-suite note: `pytest -q -x` stopped after 63 passing tests at
+`tests/integration/test_cell_map_and_topology_export.py::test_topology_aware_simplification_repairs_non_watertight_candidate`.
+The expectation was `repair_attempted=True`, while the current simplification
+path reported `False`. A separate unconstrained full run later aborted in
+PyVista/VTK interactor initialization with a Windows access violation around
+44 percent progress. Neither failure path includes the backend task modules;
+the focused 21-test task/workspace/shutdown suite passed.
+
 交接日期：2026-09-20。用途：让新的对话接手 Lattice Studio 的工程管理和后续开发。
 
 本文件按 handoff 技能要求保存在系统临时目录。文件内仓库路径均相对于 `D:\shoe(1)\shoe`；技能路径使用 `%USERPROFILE%\.codex\skills`。不包含账号、密钥或其他凭据。临时目录可能被系统清理，开启新对话时请直接附上此文件。

@@ -76,6 +76,21 @@ def request_background_thread_shutdown(
     return True, None
 
 
+def request_backend_process_shutdown(owner) -> tuple[bool, str | None]:
+    """Stop the loopback backend started by this workbench, if any."""
+
+    backend_process = getattr(owner, "backend_process", None)
+    if backend_process is None:
+        return True, None
+    try:
+        backend_process.stop()
+    except Exception as exc:
+        return False, f"local backend shutdown failed: {type(exc).__name__}: {exc}"
+    owner.backend_process = None
+    owner.backend_client = None
+    return True, None
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -1377,6 +1392,8 @@ def _build_qt_app():
             self.resize(1480, 900)
             self.setMinimumSize(1050, 700)
             self.root = PROJECT_ROOT
+            self.backend_process = None
+            self.backend_client = None
             self.design_workspace = DesignWorkspace()
             self._workspace_manifest_path: Path | None = None
             self._workspace_loading = False
@@ -1456,6 +1473,24 @@ def _build_qt_app():
                 for kind, state in self._tpms_parameter_states.items()
             }
             self._initialize_empty_workspace()
+            self._start_local_backend()
+
+        def _start_local_backend(self) -> None:
+            """Own a private backend process without coupling Qt to its transport."""
+
+            from lattice_studio.presentation.http.backend_process import (
+                BackendProcessError,
+                LocalBackendProcess,
+            )
+
+            try:
+                backend_process = LocalBackendProcess()
+                self.backend_client = backend_process.start()
+                self.backend_process = backend_process
+            except BackendProcessError as exc:
+                self.backend_process = None
+                self.backend_client = None
+                self.status.setText(f"local backend unavailable: {exc}")
 
         def _initialize_empty_workspace(self) -> None:
             """Present a clean document until the user creates or imports a design."""
@@ -9441,6 +9476,13 @@ def _build_qt_app():
             if not stopped:
                 self._close_pending = True
                 self.status.setText(message or "正在安全结束后台计算，请稍候。")
+                self._close_retry_timer.start()
+                event.ignore()
+                return
+            stopped, message = request_backend_process_shutdown(self)
+            if not stopped:
+                self._close_pending = True
+                self.status.setText(message or "local backend is still stopping")
                 self._close_retry_timer.start()
                 event.ignore()
                 return

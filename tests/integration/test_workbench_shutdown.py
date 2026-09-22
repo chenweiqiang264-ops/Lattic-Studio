@@ -88,6 +88,26 @@ def test_shutdown_ignores_threads_that_are_already_finished() -> None:
     assert thread.wait_timeouts == []
 
 
+def test_shutdown_stops_the_workbench_owned_backend_process() -> None:
+    class _BackendProcess:
+        def __init__(self) -> None:
+            self.stop_count = 0
+
+        def stop(self) -> None:
+            self.stop_count += 1
+
+    backend_process = _BackendProcess()
+    owner = SimpleNamespace(backend_process=backend_process, backend_client=object())
+
+    stopped, message = app.request_backend_process_shutdown(owner)
+
+    assert stopped is True
+    assert message is None
+    assert backend_process.stop_count == 1
+    assert owner.backend_process is None
+    assert owner.backend_client is None
+
+
 def test_viewport_shutdown_is_idempotent() -> None:
     from PyQt5 import QtCore
 

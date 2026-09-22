@@ -22,6 +22,12 @@ from lattice_studio.application.backend import (
     UnknownWorkspace,
     WorkspaceSession,
 )
+from lattice_studio.application.tasks import (
+    TaskArtifact,
+    TaskSnapshot,
+    UnknownArtifact,
+    UnknownTask,
+)
 
 
 class BackendRequestError(RuntimeError):
@@ -70,6 +76,35 @@ class LocalBackendClient:
                 {"manifest_path": manifest_path},
             )
         )
+
+    def submit_task(self, kind: str, payload: dict[str, object]) -> TaskSnapshot:
+        return TaskSnapshot.from_dict(
+            self._request("POST", "/v1/tasks", {"kind": kind, "payload": payload})
+        )
+
+    def get_task(self, identifier: str) -> TaskSnapshot:
+        return TaskSnapshot.from_dict(self._request("GET", f"/v1/tasks/{identifier}"))
+
+    def cancel_task(self, identifier: str) -> TaskSnapshot:
+        return TaskSnapshot.from_dict(
+            self._request("POST", f"/v1/tasks/{identifier}/cancel")
+        )
+
+    def download_artifact(self, identifier: str) -> bytes:
+        request = Request(
+            f"{self._base_url}/v1/artifacts/{identifier}", method="GET"
+        )
+        try:
+            with urlopen(request, timeout=self._timeout_seconds) as response:
+                return response.read()
+        except HTTPError as exc:
+            try:
+                message = str(_decode_payload(exc.read()).get("error", exc.reason))
+            except (TypeError, ValueError):
+                message = str(exc.reason)
+            raise BackendRequestError(exc.code, message) from exc
+        except URLError as exc:
+            raise BackendRequestError(0, str(exc.reason)) from exc
 
     def _request(
         self,
@@ -135,6 +170,7 @@ class LocalBackendServer:
             self._thread.join(timeout=5)
             self._thread = None
         self._httpd.server_close()
+        self.backend.close()
 
     def __enter__(self) -> "LocalBackendServer":
         return self.start()
@@ -167,6 +203,16 @@ def _handler_for(backend: LocalBackend) -> type[BaseHTTPRequestHandler]:
                     HTTPStatus.NOT_FOUND,
                     {"error": f"unknown workspace: {exc.args[0]}"},
                 )
+            except UnknownTask as exc:
+                self._write_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": f"unknown task: {exc.args[0]}"},
+                )
+            except UnknownArtifact as exc:
+                self._write_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": f"unknown artifact: {exc.args[0]}"},
+                )
             except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
                 self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             except Exception:  # pragma: no cover - defensive transport boundary
@@ -185,6 +231,28 @@ def _handler_for(backend: LocalBackend) -> type[BaseHTTPRequestHandler]:
                 return backend.create_workspace().to_dict()
             if self.command == "POST" and path == "/v1/workspaces/load":
                 return backend.load_workspace(self._json_body()["manifest_path"]).to_dict()
+            if self.command == "POST" and path == "/v1/tasks":
+                body = self._json_body()
+                return backend.submit_task(
+                    str(body["kind"]),
+                    _object_payload(body.get("payload", {}), "task payload"),
+                ).to_dict()
+
+            task_prefix = "/v1/tasks/"
+            if path.startswith(task_prefix):
+                remainder = unquote(path.removeprefix(task_prefix))
+                if self.command == "POST" and remainder.endswith("/cancel"):
+                    return backend.cancel_task(remainder.removesuffix("/cancel")).to_dict()
+                if self.command == "GET" and "/" not in remainder:
+                    return backend.get_task(remainder).to_dict()
+
+            artifact_prefix = "/v1/artifacts/"
+            if self.command == "GET" and path.startswith(artifact_prefix):
+                identifier = unquote(path.removeprefix(artifact_prefix))
+                if "/" not in identifier:
+                    artifact, artifact_path = backend.task_artifact_path(identifier)
+                    self._write_artifact(artifact, artifact_path)
+                    raise _ResponseAlreadyWritten()
 
             prefix = "/v1/workspaces/"
             if path.startswith(prefix):
@@ -215,6 +283,18 @@ def _handler_for(backend: LocalBackend) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _write_artifact(self, artifact: TaskArtifact, path) -> None:
+            body = path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", artifact.media_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{artifact.name}"',
+            )
+            self.end_headers()
+            self.wfile.write(body)
+
     return BackendRequestHandler
 
 
@@ -226,6 +306,12 @@ def _decode_payload(raw: bytes) -> dict[str, object]:
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("response JSON must be an object")
+    return value
+
+
+def _object_payload(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
     return value
 
 

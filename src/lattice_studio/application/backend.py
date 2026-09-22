@@ -12,10 +12,20 @@ from pathlib import Path
 from uuid import uuid4
 
 from lattice_studio.application.workspace import WorkspaceService
+from lattice_studio.application.backend_workflows import ImplicitWorkflowTasks
+from lattice_studio.application.tasks import (
+    BackendTaskService,
+    TaskOutcome,
+    TaskSnapshot,
+)
 from lattice_studio.domain.workspace import DesignWorkspace
 
 
 SUPPORTED_OPERATIONS = (
+    "task.submit",
+    "task.get",
+    "task.cancel",
+    "task.artifact.get",
     "workspace.create",
     "workspace.get",
     "workspace.load",
@@ -88,9 +98,20 @@ class LocalBackend:
     into the saved workspace model.
     """
 
-    def __init__(self, workspace_service: WorkspaceService | None = None) -> None:
+    def __init__(
+        self,
+        workspace_service: WorkspaceService | None = None,
+        task_service: BackendTaskService | None = None,
+    ) -> None:
         self._workspace_service = workspace_service or WorkspaceService()
         self._workspaces: dict[str, DesignWorkspace] = {}
+        self._implicit_workflow_tasks = ImplicitWorkflowTasks()
+        self._task_service = task_service or BackendTaskService(
+            {
+                "workspace.save": self._save_workspace_task,
+                **self._implicit_workflow_tasks.handlers(),
+            }
+        )
 
     def health(self) -> BackendHealth:
         """Report the stable operations implemented by this backend version."""
@@ -119,6 +140,44 @@ class LocalBackend:
         workspace = self._workspace(identifier)
         self._workspace_service.save(workspace, self._manifest_path(manifest_path))
         return self._summary(identifier, workspace)
+
+    def submit_task(
+        self,
+        kind: str,
+        payload: dict[str, object],
+    ) -> TaskSnapshot:
+        """Queue a backend-owned operation from the explicit task registry."""
+
+        return self._task_service.submit(kind, payload)
+
+    def get_task(self, identifier: str) -> TaskSnapshot:
+        return self._task_service.get(identifier)
+
+    def cancel_task(self, identifier: str) -> TaskSnapshot:
+        return self._task_service.cancel(identifier)
+
+    def task_artifact_path(self, identifier: str):
+        """Return artifact metadata and a process-local file path for transport."""
+
+        return self._task_service.artifact_path(identifier)
+
+    def close(self) -> None:
+        """Release task workers when the backend server shuts down."""
+
+        self._task_service.close()
+
+    def _save_workspace_task(
+        self,
+        payload: dict[str, object],
+        context,
+    ) -> TaskOutcome:
+        context.report("saving workspace", 0.1)
+        session = self.save_workspace(
+            str(payload["workspace_id"]),
+            str(payload["manifest_path"]),
+        )
+        context.report("workspace saved", 1.0)
+        return TaskOutcome(result={"workspace": session.to_dict()})
 
     def _register(self, workspace: DesignWorkspace) -> WorkspaceSession:
         identifier = uuid4().hex

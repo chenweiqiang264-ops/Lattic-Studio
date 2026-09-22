@@ -60,13 +60,26 @@ buffers, or renderer caches. `presentation.http.local_backend` is its loopback
 HTTP adapter, bound only to `127.0.0.1`, with a Python client adapter for the
 desktop front end.
 
-The first transport operations are workspace health, creation, loading, lookup,
-and explicit save. Existing Qt workflows remain in-process during migration.
-New remote-capable operations must first be expressed through the application
-backend interface, use serializable request and result data, and add a
-representative transport contract test. Long-running generation will use task
-identifiers and progress events rather than transferring evaluator, VTK, or GPU
-objects across the seam.
+The transport exposes workspace health, creation, loading, lookup, and explicit
+save. It also exposes a fixed asynchronous task registry: submit, status,
+cancellation, and artifact download. A task snapshot contains an ID, stable
+state (`queued`, `running`, `succeeded`, `failed`, or `cancelled`), progress,
+message, JSON-safe metadata, and artifact descriptors. Artifact files are held
+under backend-managed task directories and may not escape those directories.
+
+The first complete numerical chain is `tpms.generate` followed by
+`stl.reconstruct`. The backend retains the authoritative implicit evaluator,
+returns an opaque generation ID, publishes only a disposable NPZ display field,
+and reconstructs the STL by consuming that generation ID. The desktop process
+owns only a private backend child process and starts it on a dynamically chosen
+loopback port. It stops only that child during workbench shutdown.
+
+Existing Qt workflows remain compatibility paths while their consumers are
+migrated to backend handles and renderable artifacts. New remote-capable
+operations must first be expressed through the application backend interface,
+use serializable request and result data, and add a representative transport
+contract test. Evaluators, VTK objects, CUDA buffers, and renderer caches must
+never cross the seam.
 
 ## Workspace and persistence
 

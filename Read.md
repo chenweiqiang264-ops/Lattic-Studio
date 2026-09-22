@@ -212,3 +212,34 @@ CUDA 的 CPU 路径、STL 导出回读、Qt 主窗口启停与真实卸载均已
 - 当前架构：[docs/ENGINEERING_ARCHITECTURE.md](docs/ENGINEERING_ARCHITECTURE.md)。
 - 当前入口和目录约定：[README.md](README.md)、`pyproject.toml` 与源码目录。
 - 当前领域术语：[CONTEXT.md](CONTEXT.md)。
+
+## 2026-09-22 Backend Task Update
+
+The local backend is now a process-owned, loopback-only task service rather
+than a workspace-session adapter only. The desktop workbench starts a private
+backend child process on a free `127.0.0.1` port and stops that same process at
+shutdown.
+
+The HTTP contract supports task submission, polling, cancellation, and binary
+artifact download. Task handlers are whitelisted and may not execute arbitrary
+client-provided callables. The first real backend workflow is:
+
+```text
+TPMS mesh + JSON parameters -> tpms.generate -> generation handle + NPZ field
+generation handle -> stl.reconstruct -> STL artifact
+```
+
+The backend retains the authoritative `ImplicitBody`; the frontend receives
+only task state, serializable metadata, and derived artifacts. Do not serialize
+Qt, VTK, CUDA, trimesh, or evaluator objects across this boundary.
+
+The existing Qt workers for custom cells, transitions, shell/fusion, display
+refinement, precise rendering, and the runtime workspace state remain legacy
+in-process compatibility paths. Their migration is deliberately unfinished;
+see `docs/adr/0035-use-a-loopback-task-protocol-for-desktop-backend-work.md`.
+
+For this backend-task stage, the PyInstaller onedir and installer were rebuilt.
+The packaged executable served the loopback health endpoint successfully, and
+installer validation passed GPU runtime, CPU fallback, window lifecycle, and
+uninstall checks. The remaining UI workflow migration requires a fresh package
+verification after it is complete.

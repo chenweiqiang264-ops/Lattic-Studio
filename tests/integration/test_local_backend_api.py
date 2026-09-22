@@ -17,6 +17,10 @@ def test_local_backend_reports_supported_workspace_operations() -> None:
 
     assert health.version == "0.1.1"
     assert health.operations == (
+        "task.submit",
+        "task.get",
+        "task.cancel",
+        "task.artifact.get",
         "workspace.create",
         "workspace.get",
         "workspace.load",
