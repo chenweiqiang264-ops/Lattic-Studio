@@ -23,11 +23,18 @@ env/
 build/
 dist/
 *.spec
+!packaging/*.spec
+src/*.egg-info/
+tmp/
+!packaging/*.spec
+src/*.egg-info/
+tmp/
 
 # Local generated geometry/results
 results/
 voronoi_cells/
 *.stl
+!resources/examples/**/*.stl
 
 # OS noise
 .DS_Store
